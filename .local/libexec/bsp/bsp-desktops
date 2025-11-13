@@ -1,0 +1,193 @@
+#!/usr/bin/env zsh
+#
+# bsp-desktops - Control auto-desktop management feature
+#
+# Usage: bsp desktops <control> [args]
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+desktops_usage() {
+    cat <<'EOF'
+Usage: bsp desktops <control> [args]
+
+Control the auto-desktop management feature.
+
+Controls:
+  on                     Enable desktops feature
+  off                    Disable desktops feature
+  status                 Show feature status
+  config <key> [value]   Get or set configuration
+
+Configuration Keys:
+  start_id               Starting desktop ID (default: 1)
+  auto_naming            Enable auto-naming (true/false)
+  naming_pattern         Desktop naming pattern (e.g., "Desktop {id}")
+
+Naming Pattern Variables:
+  {id}                   Desktop ID number
+  {index}                0-based desktop index
+  {count}                Total desktop count
+
+Examples:
+  bsp desktops on                              # Enable feature
+  bsp desktops status                          # Show current status
+  bsp desktops config start_id 1               # Set starting ID
+  bsp desktops config auto_naming true         # Enable auto-naming
+  bsp desktops config naming_pattern "WS {id}" # Set naming pattern
+
+Returns:
+  0 - Success
+  1 - Daemon not running or error
+  2 - Invalid arguments
+EOF
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+desktops_enable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.desktops.enabled" "true" || return 1
+    bsp-ui-success "Desktops feature enabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+desktops_disable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.desktops.enabled" "false" || return 1
+    bsp-ui-success "Desktops feature disabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+desktops_status() {
+    # Phase 2: Read config directly (Phase 3 will use IPC)
+    local enabled=$(bsp-config-get "features.desktops.enabled" "false")
+    local start_id=$(bsp-config-get "features.desktops.start_id" "1")
+    local auto_naming=$(bsp-config-get "features.desktops.auto_naming" "false")
+    local naming_pattern=$(bsp-config-get "features.desktops.naming_pattern" "Desktop {id}")
+
+    # Get current desktop stats
+    local total=$(bspc query -D -m focused 2>/dev/null | wc -l)
+    local occupied=$(bspc query -D -m focused -d .occupied 2>/dev/null | wc -l)
+
+    bsp-ui-header "Desktops Feature Status"
+    bsp-ui-status "Status" "$([ "$enabled" == "true" ] && echo "ENABLED" || echo "DISABLED")" "$([ "$enabled" == "true" ] && echo "success" || echo "warn")"
+    bsp-ui-status "Events" "node_add, node_remove, node_state, desktop_add"
+    echo ""
+    echo "Configuration:"
+    bsp-ui-status "  Start ID" "$start_id"
+    bsp-ui-status "  Auto-naming" "$auto_naming"
+    bsp-ui-status "  Naming pattern" "$naming_pattern"
+    echo ""
+    echo "Current State:"
+    bsp-ui-status "  Total desktops" "$total"
+    bsp-ui-status "  Occupied" "$occupied"
+    bsp-ui-status "  Empty" "$((total - occupied))"
+
+    return 0
+}
+
+desktops_config() {
+    local key="$1"
+    local value="$2"
+
+    if [[ -z "$key" ]]; then
+        # Show all config
+        echo "Desktops Configuration:"
+        echo "  start_id: $(bsp-config-get 'features.desktops.start_id' '1')"
+        echo "  auto_naming: $(bsp-config-get 'features.desktops.auto_naming' 'false')"
+        echo "  naming_pattern: $(bsp-config-get 'features.desktops.naming_pattern' 'Desktop {id}')"
+        return 0
+    fi
+
+    # Validate key
+    case "$key" in
+        start_id|auto_naming|naming_pattern)
+            ;;
+        *)
+            bsp-error "Invalid config key: $key" 2
+            echo "Valid keys: start_id, auto_naming, naming_pattern" >&2
+            return 2
+            ;;
+    esac
+
+    if [[ -z "$value" ]]; then
+        # Get config value
+        local current=$(bsp-config-get "features.desktops.$key")
+        echo "$current"
+        return 0
+    else
+        # Set config value
+        bsp-config-set "features.desktops.$key" "$value" || return 1
+        bsp-ui-success "Configuration updated: $key = $value"
+        bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+        return 0
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+desktops_main() {
+    local control="${1:-}"
+
+    if [[ -z "$control" ]]; then
+        desktops_usage
+        return 2
+    fi
+
+    case "$control" in
+        on)
+            desktops_enable
+            ;;
+        off)
+            desktops_disable
+            ;;
+        status)
+            desktops_status
+            ;;
+        config)
+            shift
+            desktops_config "$@"
+            ;;
+        -h|--help|help)
+            desktops_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid control: $control" 2
+            echo "" >&2
+            desktops_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+desktops_main "$@"

@@ -1,0 +1,117 @@
+#!/usr/bin/env zsh
+#
+# bsp-fullscreen - Toggle fullscreen state for focused window
+#
+# Usage: bsp fullscreen
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+fullscreen_usage() {
+    cat <<'EOF'
+Usage: bsp fullscreen
+
+Toggle fullscreen state for the focused window.
+
+Examples:
+  bsp fullscreen        # Toggle between tiled and fullscreen
+
+Description:
+  This command toggles the focused window between tiled and fullscreen
+  states. If the window is currently tiled, it becomes fullscreen.
+  If it's fullscreen, it returns to tiled state.
+
+  Behavior:
+    - Tiled → Fullscreen: Window expands to fill entire desktop
+    - Fullscreen → Tiled: Window returns to its position in the tree
+
+  Note: This only affects tiled/fullscreen states. Floating windows
+  are not affected by this command.
+
+Returns:
+  0 - Success
+  1 - No focused window
+  2 - bspwm not running
+EOF
+}
+
+# ============================================================================
+# FULLSCREEN LOGIC
+# ============================================================================
+
+fullscreen_toggle() {
+    # Check if any window is focused
+    if ! bspc query -N -n focused > /dev/null 2>&1; then
+        bsp-error "No focused window" 1
+        return 1
+    fi
+
+    # Check if currently fullscreen
+    if bspc query -N -n .focused.fullscreen -d focused > /dev/null 2>&1; then
+        # Currently fullscreen, change to tiled
+        if bspc node focused.fullscreen -t tiled 2>/dev/null; then
+            bsp-log-info "Window changed: fullscreen → tiled"
+            return 0
+        else
+            bsp-error "Failed to change window to tiled state" 2
+            return 2
+        fi
+    else
+        # Currently tiled, change to fullscreen
+        if bspc node focused.tiled -t fullscreen 2>/dev/null; then
+            bsp-log-info "Window changed: tiled → fullscreen"
+            return 0
+        else
+            bsp-error "Failed to change window to fullscreen state" 2
+            return 2
+        fi
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+fullscreen_main() {
+    local arg="${1:-}"
+
+    case "$arg" in
+        "")
+            fullscreen_toggle
+            ;;
+        -h|--help|help)
+            fullscreen_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid argument: $arg" 2
+            echo "" >&2
+            fullscreen_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+fullscreen_main "$@"

@@ -1,0 +1,638 @@
+#!/usr/bin/env zsh
+#
+# bsp-layout - Layout profile management command
+#
+# Manage bspwm layout profiles:
+# - List available layouts
+# - Save current layout as profile
+# - Load/apply layout profiles
+# - Edit, delete, import, export layouts
+# - Interactive Rofi selector
+#
+# Usage: bsp layout <subcommand> [options] [args]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bsp"
+LAYOUT_DIR="$CONFIG_DIR/layouts"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_CACHE=false
+_HAS_LAYOUT=false
+_HAS_BSPWM=false
+_HAS_ROFI=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _cache)" 2>/dev/null && _HAS_CACHE=true
+source "$(which _layout)" 2>/dev/null && _HAS_LAYOUT=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+source "$(which _rofi)" 2>/dev/null && _HAS_ROFI=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+layout-help() {
+    cat <<'EOF'
+Usage: bsp layout <subcommand> [options] [args]
+
+Manage bspwm layout profiles.
+
+Subcommands:
+  list                          List all available layouts
+  save <name> [desktop]         Save current layout as profile
+  load <name>                   Load layout (validate only)
+  apply <name> [desktop]        Apply layout to desktop
+  current [desktop]             Show current layout mode
+  edit <name>                   Edit layout in $EDITOR
+  delete <name>                 Delete layout profile
+  export <name> <file>          Export layout to file
+  import <file> [name]          Import layout from file
+  info <name>                   Show layout information
+  select                        Interactive Rofi selector
+
+Arguments:
+  <name>                        Layout profile name
+  <desktop>                     Desktop selector (default: focused)
+  <file>                        File path for import/export
+
+Options:
+  -h, --help                    Show this help message
+  -f, --format FORMAT           Output format (names, paths, detailed, json)
+  -d, --description TEXT        Description for saved layout
+
+Examples:
+  bsp layout list               # List all layouts
+  bsp layout save my-layout     # Save focused desktop layout
+  bsp layout save dev 2         # Save desktop 2 as 'dev'
+  bsp layout apply dev          # Apply 'dev' to focused desktop
+  bsp layout apply dev 3        # Apply 'dev' to desktop 3
+  bsp layout delete old-layout  # Delete layout
+  bsp layout edit my-layout     # Edit in $EDITOR
+  bsp layout export dev ~/dev.json    # Export to file
+  bsp layout import ~/new.json custom # Import as 'custom'
+  bsp layout select             # Interactive Rofi menu
+
+Layout Files:
+  Location: ~/.config/bsp/layouts/
+  Format:   JSON
+  Schema:   version, type, name, description, monitor, tree
+
+Returns:
+  0 - Success
+  1 - General error
+  2 - Invalid arguments
+
+EOF
+}
+
+# Check dependencies
+layout-check-deps() {
+    if [[ "$_HAS_LAYOUT" != "true" ]]; then
+        echo "Error: _layout library not found" >&2
+        echo "Install: Ensure ~/.dotfiles/lib is stowed" >&2
+        return 1
+    fi
+
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        echo "Install: Ensure ~/.dotfiles/lib is stowed" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# Format layout list output
+layout-format-list() {
+    local format="${1:-names}"
+    local input="$2"
+
+    case "$format" in
+        names)
+            echo "$input"
+            ;;
+        detailed)
+            # Parse pipe-delimited format
+            echo "Available layouts:"
+            while IFS='|' read -r name description; do
+                printf "  %-20s - %s\n" "$name" "$description"
+            done <<< "$input"
+            ;;
+        json)
+            # Convert to JSON array
+            if command -v jq &>/dev/null; then
+                local layouts=()
+                while IFS='|' read -r name description; do
+                    layouts+=($(jq -n --arg name "$name" --arg desc "$description" '{name: $name, description: $desc}'))
+                done <<< "$input"
+                printf '%s\n' "${layouts[@]}" | jq -s '.'
+            else
+                echo "$input"
+            fi
+            ;;
+        paths)
+            echo "$input"
+            ;;
+        *)
+            echo "$input"
+            ;;
+    esac
+}
+
+# ============================================================================
+# SUBCOMMAND IMPLEMENTATIONS
+# ============================================================================
+
+layout-cmd-list() {
+    local format="detailed"
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                layout-help
+                return 0
+                ;;
+            -f|--format)
+                format="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                return 2
+                ;;
+            *)
+                echo "Error: Unexpected argument: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    layout-check-deps || return $?
+
+    # Get list based on format
+    local list_format
+    case "$format" in
+        names|json)
+            list_format="detailed"  # Get detailed for processing
+            ;;
+        detailed)
+            list_format="detailed"
+            ;;
+        paths)
+            list_format="paths"
+            ;;
+        *)
+            echo "Error: Invalid format: $format" >&2
+            return 2
+            ;;
+    esac
+
+    local layouts
+    layouts=$(layout-list "$list_format") || {
+        echo "Error: Failed to list layouts" >&2
+        return 1
+    }
+
+    if [[ -z "$layouts" ]]; then
+        echo "No layouts found"
+        echo "Create one with: bsp layout save <name>"
+        return 0
+    fi
+
+    # Format output
+    layout-format-list "$format" "$layouts"
+
+    return 0
+}
+
+layout-cmd-save() {
+    local name=""
+    local desktop=".focused"
+    local description=""
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                layout-help
+                return 0
+                ;;
+            -d|--description)
+                description="$2"
+                shift 2
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                return 2
+                ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    desktop="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout save <name> [desktop]" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    # Check if layout already exists
+    if layout-exists "$name"; then
+        echo "Warning: Layout '$name' already exists and will be overwritten" >&2
+        read -q "REPLY?Continue? (y/n) " || {
+            echo ""
+            echo "Cancelled"
+            return 0
+        }
+        echo ""
+    fi
+
+    echo "Saving layout '$name' from desktop '$desktop'..."
+
+    layout-save "$name" "$desktop" "$description" || {
+        echo "Error: Failed to save layout" >&2
+        return 1
+    }
+
+    echo "Layout '$name' saved successfully"
+    echo "Location: $(layout-get-path "$name")"
+
+    return 0
+}
+
+layout-cmd-load() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout load <name>" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    echo "Loading layout '$name'..."
+
+    local layout_json
+    layout_json=$(layout-load "$name") || {
+        echo "Error: Failed to load layout" >&2
+        return 1
+    }
+
+    echo "Layout loaded successfully (validation only)"
+    echo ""
+
+    # Show info
+    if command -v jq &>/dev/null; then
+        echo "$layout_json" | jq '{
+            version: .version,
+            type: .type,
+            name: .name,
+            description: .description,
+            monitor: .monitor,
+            captured_at: .captured_at
+        }'
+    else
+        echo "Layout: $name"
+    fi
+
+    echo ""
+    echo "To apply layout, use: bsp layout apply $name"
+
+    return 0
+}
+
+layout-cmd-apply() {
+    local name=""
+    local desktop=".focused"
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                layout-help
+                return 0
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                return 2
+                ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    desktop="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout apply <name> [desktop]" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    echo "Applying layout '$name' to desktop '$desktop'..."
+
+    layout-apply "$name" "$desktop" || {
+        echo "Error: Failed to apply layout" >&2
+        return 1
+    }
+
+    echo "Layout '$name' applied successfully"
+
+    return 0
+}
+
+layout-cmd-current() {
+    local desktop="${1:-.focused}"
+
+    layout-check-deps || return $?
+
+    local current
+    current=$(layout-current "$desktop") || {
+        echo "Error: Failed to get current layout" >&2
+        return 1
+    }
+
+    echo "Current layout mode: $current"
+
+    return 0
+}
+
+layout-cmd-edit() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout edit <name>" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    layout-edit "$name" || {
+        echo "Error: Failed to edit layout" >&2
+        return 1
+    }
+
+    echo "Layout '$name' edited successfully"
+
+    return 0
+}
+
+layout-cmd-delete() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout delete <name>" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    # Confirm deletion
+    read -q "REPLY?Delete layout '$name'? (y/n) " || {
+        echo ""
+        echo "Cancelled"
+        return 0
+    }
+    echo ""
+
+    layout-delete "$name" || {
+        echo "Error: Failed to delete layout" >&2
+        return 1
+    }
+
+    echo "Layout '$name' deleted successfully"
+
+    return 0
+}
+
+layout-cmd-export() {
+    local name="$1"
+    local dest_file="$2"
+
+    if [[ -z "$name" ]] || [[ -z "$dest_file" ]]; then
+        echo "Error: Layout name and destination file required" >&2
+        echo "Usage: bsp layout export <name> <file>" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    echo "Exporting layout '$name' to '$dest_file'..."
+
+    layout-export "$name" "$dest_file" || {
+        echo "Error: Failed to export layout" >&2
+        return 1
+    }
+
+    echo "Layout exported successfully"
+    echo "File: $dest_file"
+
+    return 0
+}
+
+layout-cmd-import() {
+    local src_file="$1"
+    local name="$2"
+
+    if [[ -z "$src_file" ]]; then
+        echo "Error: Source file required" >&2
+        echo "Usage: bsp layout import <file> [name]" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    echo "Importing layout from '$src_file'..."
+
+    layout-import "$src_file" "$name" || {
+        echo "Error: Failed to import layout" >&2
+        return 1
+    }
+
+    # Determine final name
+    if [[ -z "$name" ]]; then
+        name="${src_file:t:r}"
+    fi
+
+    echo "Layout imported successfully as '$name'"
+
+    return 0
+}
+
+layout-cmd-info() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Error: Layout name required" >&2
+        echo "Usage: bsp layout info <name>" >&2
+        return 2
+    fi
+
+    layout-check-deps || return $?
+
+    layout-info "$name" || {
+        echo "Error: Failed to get layout info" >&2
+        return 1
+    }
+
+    return 0
+}
+
+layout-cmd-select() {
+    if [[ "$_HAS_ROFI" != "true" ]]; then
+        echo "Error: Rofi integration not available" >&2
+        echo "Falling back to list mode" >&2
+        layout-cmd-list
+        return $?
+    fi
+
+    layout-check-deps || return $?
+
+    # Get layouts
+    local layouts
+    layouts=$(layout-list "detailed") || {
+        echo "Error: Failed to list layouts" >&2
+        return 1
+    }
+
+    if [[ -z "$layouts" ]]; then
+        echo "No layouts found" >&2
+        return 1
+    fi
+
+    # Prepare Rofi input (name only)
+    local names=()
+    while IFS='|' read -r name description; do
+        names+=("$name")
+    done <<< "$layouts"
+
+    # Show Rofi menu
+    local selected
+    if command -v rofi &>/dev/null; then
+        selected=$(printf '%s\n' "${names[@]}" | rofi -dmenu -p "Select Layout" -theme-str 'window {width: 30%;}')
+    else
+        # Fallback to fzf if available
+        if command -v fzf &>/dev/null; then
+            selected=$(printf '%s\n' "${names[@]}" | fzf --prompt="Select Layout: ")
+        else
+            echo "Error: Neither rofi nor fzf available" >&2
+            return 1
+        fi
+    fi
+
+    if [[ -z "$selected" ]]; then
+        echo "No layout selected" >&2
+        return 1
+    fi
+
+    # Apply selected layout
+    echo "Applying layout: $selected"
+    layout-apply "$selected" ".focused"
+
+    return $?
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+layout-main() {
+    local subcommand="${1:-}"
+
+    if [[ -z "$subcommand" ]] || [[ "$subcommand" == "-h" ]] || [[ "$subcommand" == "--help" ]]; then
+        layout-help
+        return 0
+    fi
+
+    shift
+
+    case "$subcommand" in
+        list)
+            layout-cmd-list "$@"
+            ;;
+        save)
+            layout-cmd-save "$@"
+            ;;
+        load)
+            layout-cmd-load "$@"
+            ;;
+        apply)
+            layout-cmd-apply "$@"
+            ;;
+        current)
+            layout-cmd-current "$@"
+            ;;
+        edit)
+            layout-cmd-edit "$@"
+            ;;
+        delete|rm)
+            layout-cmd-delete "$@"
+            ;;
+        export)
+            layout-cmd-export "$@"
+            ;;
+        import)
+            layout-cmd-import "$@"
+            ;;
+        info|show)
+            layout-cmd-info "$@"
+            ;;
+        select)
+            layout-cmd-select "$@"
+            ;;
+        *)
+            echo "Error: Unknown subcommand: $subcommand" >&2
+            echo "" >&2
+            layout-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+layout-main "$@"

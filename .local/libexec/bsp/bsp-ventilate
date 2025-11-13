@@ -1,0 +1,249 @@
+#!/usr/bin/env zsh
+#
+# bsp-ventilate - Control terminal swallowing feature
+#
+# Usage: bsp ventilate <control> [args]
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+ventilate_usage() {
+    cat <<'EOF'
+Usage: bsp ventilate <control> [args]
+
+Control the terminal swallowing (ventilate) feature.
+
+Controls:
+  on                                  Enable ventilate feature
+  off                                 Disable ventilate feature
+  status                              Show feature status
+  config add-terminal <class>         Add terminal class
+  config add-no-inhale <class>        Add no-inhale class
+  config remove-terminal <class>      Remove terminal class
+  config remove-no-inhale <class>     Remove no-inhale class
+  config list                         List current configuration
+
+Examples:
+  bsp ventilate on                              # Enable feature
+  bsp ventilate status                          # Show current status
+  bsp ventilate config add-terminal kitty       # Add kitty as terminal
+  bsp ventilate config add-no-inhale Firefox    # Prevent Firefox inhale
+  bsp ventilate config list                     # List configuration
+
+Description:
+  The ventilate feature implements terminal swallowing, where GUI applications
+  launched from terminal windows automatically hide their parent terminal,
+  restoring it when the GUI application closes.
+
+  Terminal Classes:
+    Applications recognized as terminals that can be swallowed.
+    Examples: Alacritty, Kitty, URxvt, st
+
+  No-Inhale Classes:
+    Applications that should NOT swallow terminals.
+    Examples: Firefox, Rofi, file managers, system dialogs
+
+Returns:
+  0 - Success
+  1 - Daemon not running or error
+  2 - Invalid arguments
+EOF
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+ventilate_enable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.ventilate.enabled" "true" || return 1
+    bsp-ui-success "Ventilate feature enabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+ventilate_disable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.ventilate.enabled" "false" || return 1
+    bsp-ui-success "Ventilate feature disabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+ventilate_status() {
+    # Phase 2: Read config directly (Phase 3 will use IPC)
+    local enabled=$(bsp-config-get "features.ventilate.enabled" "false")
+
+    bsp-ui-header "Ventilate Feature Status"
+    bsp-ui-status "Status" "$([ "$enabled" == "true" ] && echo "ENABLED" || echo "DISABLED")" "$([ "$enabled" == "true" ] && echo "success" || echo "warn")"
+    bsp-ui-status "Events" "node_add, node_remove"
+    echo ""
+
+    # Show current configuration
+    ventilate_config_list
+
+    return 0
+}
+
+ventilate_config() {
+    local action="$1"
+    local class="$2"
+
+    case "$action" in
+        add-terminal)
+            if [[ -z "$class" ]]; then
+                bsp-error "Terminal class required" 2
+                return 2
+            fi
+
+            # Phase 2: Direct config manipulation (simplified)
+            bsp-ui-info "Adding terminal class: $class"
+            bsp-ui-warn "Note: Config array manipulation not fully implemented in Phase 2"
+            bsp-ui-info "Manually add '$class' to features.ventilate.terminals in config.json"
+            bsp-ui-info "Then restart daemon (bsp daemon restart)"
+            return 0
+            ;;
+
+        remove-terminal)
+            if [[ -z "$class" ]]; then
+                bsp-error "Terminal class required" 2
+                return 2
+            fi
+
+            bsp-ui-info "Removing terminal class: $class"
+            bsp-ui-warn "Note: Config array manipulation not fully implemented in Phase 2"
+            bsp-ui-info "Manually remove '$class' from features.ventilate.terminals in config.json"
+            bsp-ui-info "Then restart daemon (bsp daemon restart)"
+            return 0
+            ;;
+
+        add-no-inhale)
+            if [[ -z "$class" ]]; then
+                bsp-error "No-inhale class required" 2
+                return 2
+            fi
+
+            bsp-ui-info "Adding no-inhale class: $class"
+            bsp-ui-warn "Note: Config array manipulation not fully implemented in Phase 2"
+            bsp-ui-info "Manually add '$class' to features.ventilate.no_inhale in config.json"
+            bsp-ui-info "Then restart daemon (bsp daemon restart)"
+            return 0
+            ;;
+
+        remove-no-inhale)
+            if [[ -z "$class" ]]; then
+                bsp-error "No-inhale class required" 2
+                return 2
+            fi
+
+            bsp-ui-info "Removing no-inhale class: $class"
+            bsp-ui-warn "Note: Config array manipulation not fully implemented in Phase 2"
+            bsp-ui-info "Manually remove '$class' from features.ventilate.no_inhale in config.json"
+            bsp-ui-info "Then restart daemon (bsp daemon restart)"
+            return 0
+            ;;
+
+        list)
+            ventilate_config_list
+            return 0
+            ;;
+
+        *)
+            bsp-error "Invalid config action: $action" 2
+            echo "Valid actions: add-terminal, remove-terminal, add-no-inhale, remove-no-inhale, list" >&2
+            return 2
+            ;;
+    esac
+}
+
+ventilate_config_list() {
+    echo "Terminal Classes:"
+    # Read terminals array from config
+    if command -v jq &>/dev/null && [[ -f "$BSP_CONFIG_FILE" ]]; then
+        local terminals=$(jq -r '.features.ventilate.terminals[]' "$BSP_CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$terminals" ]]; then
+            echo "$terminals" | sed 's/^/  - /'
+        else
+            echo "  (none configured)"
+        fi
+    else
+        echo "  (jq required to read configuration)"
+    fi
+
+    echo ""
+    echo "No-Inhale Classes:"
+    # Read no_inhale array from config
+    if command -v jq &>/dev/null && [[ -f "$BSP_CONFIG_FILE" ]]; then
+        local no_inhale=$(jq -r '.features.ventilate.no_inhale[]' "$BSP_CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$no_inhale" ]]; then
+            echo "$no_inhale" | sed 's/^/  - /'
+        else
+            echo "  (none configured)"
+        fi
+    else
+        echo "  (jq required to read configuration)"
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+ventilate_main() {
+    local control="${1:-}"
+
+    if [[ -z "$control" ]]; then
+        ventilate_usage
+        return 2
+    fi
+
+    case "$control" in
+        on)
+            ventilate_enable
+            ;;
+        off)
+            ventilate_disable
+            ;;
+        status)
+            ventilate_status
+            ;;
+        config)
+            shift
+            ventilate_config "$@"
+            ;;
+        -h|--help|help)
+            ventilate_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid control: $control" 2
+            echo "" >&2
+            ventilate_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+ventilate_main "$@"

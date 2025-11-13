@@ -1,0 +1,597 @@
+#!/usr/bin/env zsh
+#
+# bsp-migrate - Migration tool from old bsp utilities to v2.0
+#
+# This script helps migrate from the old standalone utilities
+# (bsp-balance, bsp-desktops, etc.) to the new unified bsp system.
+#
+# Usage: bsp-migrate [--dry-run] [--auto] [--rollback]
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BSP_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+MIGRATION_LOG="$HOME/.cache/bsp/migration.log"
+BACKUP_DIR="$HOME/.cache/bsp/backup-$(date +%Y%m%d-%H%M%S)"
+
+# Migration state
+DRY_RUN=false
+AUTO_MODE=false
+ROLLBACK_MODE=false
+VERBOSE=true
+
+# ============================================================================
+# COLORS AND ICONS
+# ============================================================================
+
+# Color codes
+C_RESET="\033[0m"
+C_RED="\033[31m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_BLUE="\033[34m"
+C_CYAN="\033[36m"
+C_BOLD="\033[1m"
+
+# Icons
+ICON_SUCCESS="✓"
+ICON_ERROR="✗"
+ICON_WARNING="⚠"
+ICON_INFO="ℹ"
+ICON_ARROW="→"
+ICON_CHECK="☑"
+
+# ============================================================================
+# LOGGING FUNCTIONS
+# ============================================================================
+
+log-msg() {
+    local level="$1"
+    local icon="$2"
+    local color="$3"
+    shift 3
+    local message="$*"
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "${color}${icon} ${message}${C_RESET}"
+    fi
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$MIGRATION_LOG"
+}
+
+log-info() {
+    log-msg "INFO" "$ICON_INFO" "$C_BLUE" "$@"
+}
+
+log-success() {
+    log-msg "SUCCESS" "$ICON_SUCCESS" "$C_GREEN" "$@"
+}
+
+log-error() {
+    log-msg "ERROR" "$ICON_ERROR" "$C_RED" "$@"
+}
+
+log-warning() {
+    log-msg "WARNING" "$ICON_WARNING" "$C_YELLOW" "$@"
+}
+
+log-step() {
+    echo ""
+    log-msg "STEP" "$ICON_ARROW" "$C_CYAN" "$@"
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+confirm() {
+    local prompt="$1"
+    local default="${2:-n}"
+
+    if [[ "$AUTO_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    local yn
+    read -r "yn?$prompt [y/N]: "
+    yn="${yn:-$default}"
+
+    case "$yn" in
+        [Yy]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+command-exists() {
+    command -v "$1" &>/dev/null
+}
+
+# ============================================================================
+# DETECTION FUNCTIONS
+# ============================================================================
+
+detect-old-installation() {
+    log-step "Detecting old bsp installation"
+
+    local old_commands=(
+        "bsp-balance"
+        "bsp-desktops"
+        "bsp-flag"
+        "bsp-floating-borders"
+        "bsp-ventilate"
+        "bsp-side"
+        "bsp-shroud"
+        "bsp-fullscreen"
+    )
+
+    local found_count=0
+
+    for cmd in "${old_commands[@]}"; do
+        if [[ -x "$HOME/.local/bin/$cmd" ]] || command-exists "$cmd"; then
+            log-info "Found old command: $cmd"
+            ((found_count++))
+        fi
+    done
+
+    if [[ $found_count -eq 0 ]]; then
+        log-warning "No old bsp utilities detected"
+        return 1
+    fi
+
+    log-success "Detected $found_count old bsp utilities"
+    return 0
+}
+
+detect-old-services() {
+    log-step "Detecting old systemd services"
+
+    local old_services=(
+        "bsp-balance"
+        "bsp-desktops"
+        "bsp-flag"
+        "bsp-floating-borders"
+        "bsp-ventilate"
+    )
+
+    local found_count=0
+
+    for service in "${old_services[@]}"; do
+        if systemctl --user is-enabled "${service}.service" &>/dev/null; then
+            log-info "Found enabled service: ${service}.service"
+            ((found_count++))
+        fi
+    done
+
+    if [[ $found_count -eq 0 ]]; then
+        log-info "No old systemd services detected"
+        return 1
+    fi
+
+    log-warning "Detected $found_count old systemd services"
+    return 0
+}
+
+# ============================================================================
+# BACKUP FUNCTIONS
+# ============================================================================
+
+backup-old-installation() {
+    log-step "Backing up old installation"
+
+    mkdir -p "$BACKUP_DIR"
+
+    # Backup old binaries
+    if [[ -d "$HOME/.local/bin" ]]; then
+        log-info "Backing up old binaries..."
+        mkdir -p "$BACKUP_DIR/bin"
+
+        local old_commands=(
+            "bsp-balance" "bsp-desktops" "bsp-flag"
+            "bsp-floating-borders" "bsp-ventilate"
+            "bsp-side" "bsp-shroud" "bsp-fullscreen"
+        )
+
+        for cmd in "${old_commands[@]}"; do
+            if [[ -f "$HOME/.local/bin/$cmd" ]]; then
+                cp "$HOME/.local/bin/$cmd" "$BACKUP_DIR/bin/"
+                log-info "  Backed up: $cmd"
+            fi
+        done
+    fi
+
+    # Backup old configuration
+    if [[ -d "$HOME/.config/bsp" ]]; then
+        log-info "Backing up old configuration..."
+        cp -r "$HOME/.config/bsp" "$BACKUP_DIR/config"
+    fi
+
+    # Backup systemd services
+    if [[ -d "$HOME/.config/systemd/user" ]]; then
+        log-info "Backing up systemd service files..."
+        mkdir -p "$BACKUP_DIR/systemd"
+
+        local old_services=(
+            "bsp-balance.service" "bsp-desktops.service"
+            "bsp-flag.service" "bsp-floating-borders.service"
+            "bsp-ventilate.service"
+        )
+
+        for service in "${old_services[@]}"; do
+            if [[ -f "$HOME/.config/systemd/user/$service" ]]; then
+                cp "$HOME/.config/systemd/user/$service" "$BACKUP_DIR/systemd/"
+                log-info "  Backed up: $service"
+            fi
+        done
+    fi
+
+    log-success "Backup created at: $BACKUP_DIR"
+}
+
+# ============================================================================
+# MIGRATION FUNCTIONS
+# ============================================================================
+
+stop-old-services() {
+    log-step "Stopping old systemd services"
+
+    local old_services=(
+        "bsp-balance" "bsp-desktops" "bsp-flag"
+        "bsp-floating-borders" "bsp-ventilate"
+    )
+
+    for service in "${old_services[@]}"; do
+        if systemctl --user is-active "${service}.service" &>/dev/null; then
+            if [[ "$DRY_RUN" == "false" ]]; then
+                log-info "Stopping ${service}.service..."
+                systemctl --user stop "${service}.service"
+            else
+                log-info "[DRY RUN] Would stop ${service}.service"
+            fi
+        fi
+    done
+}
+
+disable-old-services() {
+    log-step "Disabling old systemd services"
+
+    local old_services=(
+        "bsp-balance" "bsp-desktops" "bsp-flag"
+        "bsp-floating-borders" "bsp-ventilate"
+    )
+
+    for service in "${old_services[@]}"; do
+        if systemctl --user is-enabled "${service}.service" &>/dev/null; then
+            if [[ "$DRY_RUN" == "false" ]]; then
+                log-info "Disabling ${service}.service..."
+                systemctl --user disable "${service}.service"
+            else
+                log-info "[DRY RUN] Would disable ${service}.service"
+            fi
+        fi
+    done
+}
+
+migrate-configuration() {
+    log-step "Migrating configuration"
+
+    # The new config.json should already be created by bsp-common-init
+    # This function can be enhanced to migrate custom settings
+
+    if [[ -f "$BACKUP_DIR/config/config.json" ]]; then
+        log-info "Old configuration detected"
+        log-info "New configuration uses JSON format at: $HOME/.config/bsp/config.json"
+        log-warning "Please review and manually merge any custom settings"
+    else
+        log-info "No old configuration to migrate"
+    fi
+}
+
+create-compatibility-shims() {
+    log-step "Creating backward compatibility shims"
+
+    local compat_dir="$BSP_ROOT/.local/libexec/bsp/compat"
+    mkdir -p "$compat_dir"
+
+    # Map old commands to new commands
+    declare -A command_map=(
+        ["bsp-balance"]="bsp balance"
+        ["bsp-desktops"]="bsp desktops"
+        ["bsp-flag"]="bsp flag"
+        ["bsp-floating-borders"]="bsp borders"
+        ["bsp-ventilate"]="bsp ventilate"
+        ["bsp-side"]="bsp side"
+        ["bsp-shroud"]="bsp shroud"
+        ["bsp-fullscreen"]="bsp fullscreen"
+    )
+
+    for old_cmd in "${(@k)command_map}"; do
+        local new_cmd="${command_map[$old_cmd]}"
+        local shim_file="$compat_dir/$old_cmd"
+
+        if [[ "$DRY_RUN" == "false" ]]; then
+            cat > "$shim_file" <<EOF
+#!/usr/bin/env zsh
+# Compatibility shim: $old_cmd -> $new_cmd
+# This is a deprecated wrapper. Please update to use: $new_cmd
+
+echo "Warning: '$old_cmd' is deprecated. Use '$new_cmd' instead" >&2
+exec $new_cmd "\$@"
+EOF
+            chmod +x "$shim_file"
+            log-info "Created shim: $old_cmd -> $new_cmd"
+        else
+            log-info "[DRY RUN] Would create shim: $old_cmd -> $new_cmd"
+        fi
+    done
+
+    log-success "Compatibility shims created in: $compat_dir"
+}
+
+update-user-scripts() {
+    log-step "Checking for user scripts that need updating"
+
+    log-warning "Please update any custom scripts or keybindings that use old commands:"
+    echo ""
+    echo "  Old Command              New Command"
+    echo "  ${C_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo "  bsp-balance          →   bsp balance"
+    echo "  bsp-desktops         →   bsp desktop"
+    echo "  bsp-flag             →   bsp flag"
+    echo "  bsp-floating-borders →   bsp borders"
+    echo "  bsp-ventilate        →   bsp ventilate"
+    echo "  bsp-side             →   bsp side"
+    echo "  bsp-shroud           →   bsp shroud"
+    echo "  bsp-fullscreen       →   bsp fullscreen"
+    echo ""
+
+    # Check common locations
+    local check_files=(
+        "$HOME/.config/sxhkd/sxhkdrc"
+        "$HOME/.config/bspwm/bspwmrc"
+    )
+
+    for file in "${check_files[@]}"; do
+        if [[ -f "$file" ]]; then
+            local count=$(grep -c "bsp-\(balance\|desktops\|flag\|floating-borders\|ventilate\|side\|shroud\|fullscreen\)" "$file" 2>/dev/null || echo "0")
+            if [[ $count -gt 0 ]]; then
+                log-warning "Found $count old command references in: $file"
+            fi
+        fi
+    done
+}
+
+enable-new-service() {
+    log-step "Setting up new bspd service"
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        # Link systemd service files if using stow
+        if [[ -f "$BSP_ROOT/.config/systemd/user/bspd.service" ]]; then
+            log-info "Systemd service file available at: $BSP_ROOT/.config/systemd/user/bspd.service"
+
+            if confirm "Enable bspd systemd service?"; then
+                systemctl --user daemon-reload
+                systemctl --user enable bspd.service
+                log-success "Enabled bspd.service"
+
+                if confirm "Start bspd service now?"; then
+                    systemctl --user start bspd.service
+                    log-success "Started bspd.service"
+                fi
+            fi
+        else
+            log-warning "Systemd service file not found. Install using 'cd ~/.pkgs && stow bsp'"
+        fi
+    else
+        log-info "[DRY RUN] Would enable and start bspd.service"
+    fi
+}
+
+# ============================================================================
+# ROLLBACK FUNCTIONS
+# ============================================================================
+
+rollback-migration() {
+    log-step "Rolling back migration"
+
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log-error "No backup found at: $BACKUP_DIR"
+        return 1
+    fi
+
+    log-info "Restoring from backup: $BACKUP_DIR"
+
+    # Stop new service
+    if systemctl --user is-active bspd.service &>/dev/null; then
+        log-info "Stopping bspd.service..."
+        systemctl --user stop bspd.service
+        systemctl --user disable bspd.service
+    fi
+
+    # Restore old binaries
+    if [[ -d "$BACKUP_DIR/bin" ]]; then
+        log-info "Restoring old binaries..."
+        cp -f "$BACKUP_DIR/bin/"* "$HOME/.local/bin/" 2>/dev/null || true
+    fi
+
+    # Restore old configuration
+    if [[ -d "$BACKUP_DIR/config" ]]; then
+        log-info "Restoring old configuration..."
+        rm -rf "$HOME/.config/bsp"
+        cp -r "$BACKUP_DIR/config" "$HOME/.config/bsp"
+    fi
+
+    # Restore and enable old services
+    if [[ -d "$BACKUP_DIR/systemd" ]]; then
+        log-info "Restoring old systemd services..."
+        cp -f "$BACKUP_DIR/systemd/"* "$HOME/.config/systemd/user/" 2>/dev/null || true
+        systemctl --user daemon-reload
+
+        local old_services=(
+            "bsp-balance" "bsp-desktops" "bsp-flag"
+            "bsp-floating-borders" "bsp-ventilate"
+        )
+
+        for service in "${old_services[@]}"; do
+            if [[ -f "$HOME/.config/systemd/user/${service}.service" ]]; then
+                systemctl --user enable "${service}.service"
+                systemctl --user start "${service}.service"
+                log-info "Restored ${service}.service"
+            fi
+        done
+    fi
+
+    log-success "Rollback completed"
+}
+
+# ============================================================================
+# MAIN MIGRATION FLOW
+# ============================================================================
+
+show-usage() {
+    cat <<EOF
+Usage: bsp-migrate [OPTIONS]
+
+Migrate from old bsp utilities to unified bsp v2.0 system.
+
+Options:
+  --dry-run     Show what would be done without making changes
+  --auto        Run migration automatically without prompts
+  --rollback    Rollback to the most recent backup
+  -h, --help    Show this help message
+
+Examples:
+  bsp-migrate --dry-run    # Preview migration
+  bsp-migrate              # Interactive migration
+  bsp-migrate --auto       # Automatic migration
+  bsp-migrate --rollback   # Undo migration
+
+The migration process:
+  1. Detects old installation
+  2. Creates backup
+  3. Stops and disables old services
+  4. Migrates configuration
+  5. Creates compatibility shims
+  6. Enables new bspd service
+
+Backup location: ~/.cache/bsp/backup-YYYYMMDD-HHMMSS/
+
+EOF
+}
+
+run-migration() {
+    # Initialize logging
+    mkdir -p "$(dirname "$MIGRATION_LOG")"
+    echo "=== BSP Migration Started at $(date) ===" >> "$MIGRATION_LOG"
+
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}  BSP Migration Tool v2.0${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log-warning "DRY RUN MODE - No changes will be made"
+        echo ""
+    fi
+
+    # Phase 1: Detection
+    if ! detect-old-installation; then
+        log-info "No migration needed"
+        return 0
+    fi
+
+    detect-old-services
+
+    # Confirm migration
+    if ! confirm "Proceed with migration?"; then
+        log-info "Migration cancelled"
+        return 0
+    fi
+
+    # Phase 2: Backup
+    if [[ "$DRY_RUN" == "false" ]]; then
+        backup-old-installation
+    else
+        log-info "[DRY RUN] Would create backup at: $BACKUP_DIR"
+    fi
+
+    # Phase 3: Migration steps
+    stop-old-services
+    disable-old-services
+    migrate-configuration
+    create-compatibility-shims
+
+    # Phase 4: Setup new system
+    enable-new-service
+
+    # Phase 5: User action items
+    update-user-scripts
+
+    # Summary
+    echo ""
+    echo -e "${C_BOLD}${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}  Migration Completed Successfully${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo ""
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+        log-success "Backup saved to: $BACKUP_DIR"
+        log-success "Compatibility shims created for old commands"
+        log-info "Check migration log: $MIGRATION_LOG"
+
+        echo ""
+        echo -e "${C_YELLOW}Next steps:${C_RESET}"
+        echo "  1. Update scripts/keybindings to use new 'bsp' command"
+        echo "  2. Review new configuration: ~/.config/bsp/config.json"
+        echo "  3. Test the new system: bsp status"
+        echo "  4. If issues occur, rollback: bsp-migrate --rollback"
+        echo ""
+    fi
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --auto)
+                AUTO_MODE=true
+                shift
+                ;;
+            --rollback)
+                ROLLBACK_MODE=true
+                shift
+                ;;
+            -h|--help)
+                show-usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option: $1" >&2
+                show-usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Run rollback or migration
+    if [[ "$ROLLBACK_MODE" == "true" ]]; then
+        rollback-migration
+    else
+        run-migration
+    fi
+}
+
+main "$@"

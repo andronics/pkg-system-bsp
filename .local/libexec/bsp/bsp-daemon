@@ -1,0 +1,270 @@
+#!/usr/bin/env zsh
+#
+# bsp-daemon - Unified daemon control for bsp
+#
+# Controls the bspd unified daemon (start, stop, restart, status, reload)
+#
+# Usage: bsp daemon <subcommand>
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+
+# Daemon binary path
+DAEMON_BIN="$SCRIPT_DIR/bspd"
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+daemon-help() {
+    cat <<'EOF'
+Usage: bsp daemon <subcommand>
+
+Control the unified bsp daemon.
+
+Subcommands:
+  start               Start the daemon
+  stop                Stop the daemon
+  restart             Restart the daemon
+  status              Show daemon status
+  reload              Reload configuration without restart
+
+Options:
+  -h, --help          Show this help
+
+The daemon manages all event-driven features:
+  - balance: Auto-balance window tree
+  - desktops: Dynamic desktop management
+  - flag: React to window flag changes
+  - floating-borders: Remove borders from floating windows
+  - ventilate: Terminal window swallowing
+
+Examples:
+  bsp daemon start         # Start daemon
+  bsp daemon status        # Check if running
+  bsp daemon reload        # Reload config
+  bsp daemon restart       # Restart daemon
+
+Returns:
+  0 - Success
+  1 - Daemon not running (for stop/restart/reload/status)
+  2 - Daemon already running (for start)
+  3 - Failed to start/stop
+EOF
+}
+
+# ============================================================================
+# DAEMON COMMANDS
+# ============================================================================
+
+daemon-start() {
+    # Check if already running
+    if bsp-daemon-running; then
+        local pid
+        pid=$(bsp-daemon-pid)
+        bsp-ui-error "Daemon already running (PID $pid)"
+        return 2
+    fi
+
+    # Check if daemon binary exists
+    if [[ ! -x "$DAEMON_BIN" ]]; then
+        bsp-ui-error "Daemon binary not found: $DAEMON_BIN"
+        return 3
+    fi
+
+    bsp-ui-info "Starting bsp daemon..."
+
+    # Start daemon in background
+    "$DAEMON_BIN" &
+    local daemon_pid=$!
+
+    # Give daemon time to initialize
+    sleep 0.5
+
+    # Verify daemon started successfully
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        bsp-ui-success "Daemon started (PID $daemon_pid)"
+        return 0
+    else
+        bsp-ui-error "Failed to start daemon"
+        return 3
+    fi
+}
+
+daemon-stop() {
+    # Check if running
+    if ! bsp-daemon-running; then
+        bsp-ui-error "Daemon not running"
+        return 1
+    fi
+
+    local pid
+    pid=$(bsp-daemon-pid)
+
+    bsp-ui-info "Stopping bsp daemon (PID $pid)..."
+
+    # Send TERM signal
+    if kill -TERM "$pid" 2>/dev/null; then
+        # Wait for daemon to exit (up to 5 seconds)
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [[ $count -lt 50 ]]; do
+            sleep 0.1
+            count=$((count + 1))
+        done
+
+        # Check if daemon stopped
+        if ! kill -0 "$pid" 2>/dev/null; then
+            # Clean up PID file
+            rm -f "$BSP_DAEMON_PIDFILE"
+            bsp-ui-success "Daemon stopped"
+            return 0
+        else
+            # Force kill if still running
+            bsp-log-warn "Daemon did not stop gracefully, forcing..."
+            kill -KILL "$pid" 2>/dev/null
+            rm -f "$BSP_DAEMON_PIDFILE"
+            bsp-ui-success "Daemon killed"
+            return 0
+        fi
+    else
+        bsp-ui-error "Failed to stop daemon"
+        return 3
+    fi
+}
+
+daemon-restart() {
+    bsp-ui-info "Restarting bsp daemon..."
+
+    # Stop daemon if running
+    if bsp-daemon-running; then
+        daemon-stop || return $?
+        sleep 0.5
+    fi
+
+    # Start daemon
+    daemon-start
+}
+
+daemon-status() {
+    if bsp-daemon-running; then
+        local pid
+        pid=$(bsp-daemon-pid)
+
+        # Get uptime
+        local start_time
+        if [[ -f "/proc/$pid/stat" ]]; then
+            start_time=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+            local boot_time
+            boot_time=$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null)
+            local now
+            now=$(date +%s)
+            local uptime
+            uptime=$((now - boot_time - start_time / 100))
+
+            bsp-ui-header "BSP Daemon Status"
+            bsp-ui-status "Status" "RUNNING" "success"
+            bsp-ui-status "PID" "$pid"
+            bsp-ui-status "Uptime" "$(bsp-format-uptime $uptime)"
+        else
+            bsp-ui-header "BSP Daemon Status"
+            bsp-ui-status "Status" "RUNNING" "success"
+            bsp-ui-status "PID" "$pid"
+        fi
+
+        bsp-ui-status "Socket" "$BSP_DAEMON_SOCKET"
+        bsp-ui-status "Log" "$BSP_DAEMON_LOGFILE"
+
+        echo ""
+        echo "Features:"
+
+        # Show enabled features
+        for feature in balance desktops flag floating-borders ventilate; do
+            if bsp-feature-enabled "$feature"; then
+                bsp-ui-status "$feature" "ENABLED" "success"
+            else
+                bsp-ui-status "$feature" "DISABLED" "warn"
+            fi
+        done
+
+        echo ""
+        return 0
+    else
+        bsp-ui-header "BSP Daemon Status"
+        bsp-ui-status "Status" "NOT RUNNING" "error"
+        echo ""
+        echo "Start with: bsp daemon start"
+        echo ""
+        return 1
+    fi
+}
+
+daemon-reload() {
+    # Check if running
+    if ! bsp-daemon-running; then
+        bsp-ui-error "Daemon not running"
+        return 1
+    fi
+
+    local pid
+    pid=$(bsp-daemon-pid)
+
+    bsp-ui-info "Reloading daemon configuration..."
+
+    # Send HUP signal to reload config
+    if kill -HUP "$pid" 2>/dev/null; then
+        bsp-ui-success "Configuration reloaded"
+        return 0
+    else
+        bsp-ui-error "Failed to reload configuration"
+        return 3
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+daemon-main() {
+    local subcommand="${1:-}"
+    shift || true
+
+    # Handle help
+    if [[ -z "$subcommand" ]] || [[ "$subcommand" == "-h" ]] || [[ "$subcommand" == "--help" ]]; then
+        daemon-help
+        return 0
+    fi
+
+    # Route to subcommand
+    case "$subcommand" in
+        start)
+            daemon-start "$@"
+            ;;
+        stop)
+            daemon-stop "$@"
+            ;;
+        restart)
+            daemon-restart "$@"
+            ;;
+        status)
+            daemon-status "$@"
+            ;;
+        reload)
+            daemon-reload "$@"
+            ;;
+        *)
+            echo "Error: Unknown subcommand: $subcommand" >&2
+            echo "" >&2
+            daemon-help
+            return 1
+            ;;
+    esac
+}
+
+daemon-main "$@"

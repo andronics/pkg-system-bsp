@@ -1,0 +1,458 @@
+#!/usr/bin/env zsh
+#
+# bsp-desktop - Desktop operations command
+#
+# User-friendly wrappers for bspwm desktop operations:
+# - Focus desktops
+# - Add/remove desktops
+# - Rename desktops
+# - Swap desktops
+# - Change layout mode
+# - Move windows between desktops
+#
+# Usage: bsp desktop <operation> [args]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_BSPWM=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+desktop-help() {
+    cat <<'EOF'
+Usage: bsp desktop <operation> [args]
+
+Desktop operations for bspwm.
+
+Operations:
+  focus <selector>              Focus desktop
+  add [name]                    Add new desktop
+  remove <selector>             Remove desktop
+  rename <selector> <name>      Rename desktop
+  swap <sel1> <sel2>            Swap two desktops
+  layout <selector> <mode>      Set layout mode (tiled/monocle)
+  move-window <dest>            Move focused window to desktop
+  list                          List all desktops
+  info <selector>               Show desktop information
+
+Selectors:
+  .focused                      Focused desktop
+  .last                         Last focused desktop
+  .next                         Next desktop
+  .prev                         Previous desktop
+  ^N                            Desktop on monitor N
+  <name>                        Desktop by name
+  <number>                      Desktop by number
+
+Layout Modes:
+  tiled                         Tiled layout (default)
+  monocle                       Monocle layout (fullscreen stacking)
+
+Options:
+  -h, --help                    Show this help message
+
+Examples:
+  bsp desktop focus 2           # Focus desktop 2
+  bsp desktop add work          # Add desktop named 'work'
+  bsp desktop remove .last      # Remove last desktop
+  bsp desktop rename 3 code     # Rename desktop 3 to 'code'
+  bsp desktop swap 1 2          # Swap desktops 1 and 2
+  bsp desktop layout .focused monocle   # Set monocle layout
+  bsp desktop move-window 2     # Move window to desktop 2
+  bsp desktop list              # List all desktops
+  bsp desktop info .focused     # Show focused desktop info
+
+Returns:
+  0 - Success
+  1 - Error
+  2 - Invalid arguments
+
+EOF
+}
+
+# Check dependencies
+desktop-check-deps() {
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        return 1
+    fi
+
+    if ! command -v bspc &>/dev/null; then
+        echo "Error: bspc not found" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# OPERATION IMPLEMENTATIONS
+# ============================================================================
+
+desktop-op-focus() {
+    local selector="${1:-.focused}"
+
+    desktop-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Focusing desktop" "selector=$selector"
+
+    bspc desktop "$selector" --focus || {
+        echo "Error: Failed to focus desktop: $selector" >&2
+        return 1
+    }
+
+    echo "Focused desktop: $selector"
+    return 0
+}
+
+desktop-op-add() {
+    local name="${1:-}"
+
+    desktop-check-deps || return $?
+
+    if [[ -z "$name" ]]; then
+        # Generate unique name
+        local count
+        count=$(bspwm-query-desktops | wc -l)
+        name="Desktop$((count + 1))"
+    fi
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Adding desktop" "name=$name"
+
+    bspc monitor --add-desktops "$name" || {
+        echo "Error: Failed to add desktop: $name" >&2
+        return 1
+    }
+
+    echo "Added desktop: $name"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:added" "name=$name"
+
+    return 0
+}
+
+desktop-op-remove() {
+    local selector="${1:-}"
+
+    if [[ -z "$selector" ]]; then
+        echo "Error: Desktop selector required" >&2
+        echo "Usage: bsp desktop remove <selector>" >&2
+        return 2
+    fi
+
+    desktop-check-deps || return $?
+
+    # Confirm if not using --force flag
+    local desktop_name
+    desktop_name=$(bspwm-desktop-get-property "$selector" "name" 2>/dev/null || echo "$selector")
+
+    read -q "REPLY?Remove desktop '$desktop_name'? (y/n) " || {
+        echo ""
+        echo "Cancelled"
+        return 0
+    }
+    echo ""
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Removing desktop" "selector=$selector"
+
+    bspc desktop "$selector" --remove || {
+        echo "Error: Failed to remove desktop: $selector" >&2
+        return 1
+    }
+
+    echo "Removed desktop: $desktop_name"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:removed" "name=$desktop_name"
+
+    return 0
+}
+
+desktop-op-rename() {
+    local selector="${1:-}"
+    local new_name="${2:-}"
+
+    if [[ -z "$selector" ]] || [[ -z "$new_name" ]]; then
+        echo "Error: Desktop selector and new name required" >&2
+        echo "Usage: bsp desktop rename <selector> <name>" >&2
+        return 2
+    fi
+
+    desktop-check-deps || return $?
+
+    local old_name
+    old_name=$(bspwm-desktop-get-property "$selector" "name" 2>/dev/null || echo "$selector")
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Renaming desktop" "from=$old_name to=$new_name"
+
+    bspc desktop "$selector" --rename "$new_name" || {
+        echo "Error: Failed to rename desktop: $selector" >&2
+        return 1
+    }
+
+    echo "Renamed desktop: $old_name -> $new_name"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:renamed" "from=$old_name to=$new_name"
+
+    return 0
+}
+
+desktop-op-swap() {
+    local sel1="${1:-}"
+    local sel2="${2:-}"
+
+    if [[ -z "$sel1" ]] || [[ -z "$sel2" ]]; then
+        echo "Error: Two desktop selectors required" >&2
+        echo "Usage: bsp desktop swap <selector1> <selector2>" >&2
+        return 2
+    fi
+
+    desktop-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Swapping desktops" "sel1=$sel1 sel2=$sel2"
+
+    bspc desktop "$sel1" --swap "$sel2" || {
+        echo "Error: Failed to swap desktops" >&2
+        return 1
+    }
+
+    echo "Swapped desktops: $sel1 <-> $sel2"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:swapped" "sel1=$sel1 sel2=$sel2"
+
+    return 0
+}
+
+desktop-op-layout() {
+    local selector="${1:-}"
+    local mode="${2:-}"
+
+    if [[ -z "$selector" ]] || [[ -z "$mode" ]]; then
+        echo "Error: Desktop selector and layout mode required" >&2
+        echo "Usage: bsp desktop layout <selector> <mode>" >&2
+        echo "Modes: tiled, monocle" >&2
+        return 2
+    fi
+
+    # Validate mode
+    if [[ "$mode" != "tiled" ]] && [[ "$mode" != "monocle" ]]; then
+        echo "Error: Invalid layout mode: $mode" >&2
+        echo "Valid modes: tiled, monocle" >&2
+        return 2
+    fi
+
+    desktop-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Setting desktop layout" "selector=$selector mode=$mode"
+
+    bspc desktop "$selector" --layout "$mode" || {
+        echo "Error: Failed to set layout mode" >&2
+        return 1
+    }
+
+    echo "Set desktop layout: $selector -> $mode"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:layout" "selector=$selector mode=$mode"
+
+    return 0
+}
+
+desktop-op-move-window() {
+    local dest="${1:-}"
+
+    if [[ -z "$dest" ]]; then
+        echo "Error: Destination desktop required" >&2
+        echo "Usage: bsp desktop move-window <desktop>" >&2
+        return 2
+    fi
+
+    desktop-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Moving window to desktop" "dest=$dest"
+
+    bspc node --to-desktop "$dest" || {
+        echo "Error: Failed to move window to desktop: $dest" >&2
+        return 1
+    }
+
+    echo "Moved window to desktop: $dest"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "desktop:window-moved" "dest=$dest"
+
+    return 0
+}
+
+desktop-op-list() {
+    desktop-check-deps || return $?
+
+    # Get all desktops
+    local desktops
+    desktops=$(bspwm-query-desktops) || {
+        echo "Error: Failed to query desktops" >&2
+        return 1
+    }
+
+    if [[ -z "$desktops" ]]; then
+        echo "No desktops found"
+        return 0
+    fi
+
+    echo "Desktops:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local focused_desktop
+    focused_desktop=$(bspwm-query-desktops ".focused" 2>/dev/null)
+
+    while IFS= read -r desktop_id; do
+        local name monitor layout nodes_count
+        name=$(bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "?")
+        monitor=$(bspwm-desktop-get-property "$desktop_id" "monitor" 2>/dev/null || echo "?")
+        layout=$(bspwm-desktop-get-property "$desktop_id" "layout" 2>/dev/null || echo "?")
+
+        # Count nodes
+        local nodes
+        nodes=$(bspwm-query-nodes -d "$desktop_id" 2>/dev/null || echo "")
+        nodes_count=$(echo "$nodes" | grep -c . || echo "0")
+
+        # Determine if focused
+        local focus_marker=""
+        if [[ "$desktop_id" == "$focused_desktop" ]]; then
+            focus_marker="*"
+        else
+            focus_marker=" "
+        fi
+
+        # Determine occupied status
+        local occupied_marker
+        if [[ "$nodes_count" -gt 0 ]]; then
+            occupied_marker="●"
+        else
+            occupied_marker="○"
+        fi
+
+        printf "  [%s] %s %-15s  Monitor: %-10s  Layout: %-8s  Windows: %d\n" \
+            "$focus_marker" "$occupied_marker" "$name" "$monitor" "$layout" "$nodes_count"
+    done <<< "$desktops"
+
+    return 0
+}
+
+desktop-op-info() {
+    local selector="${1:-.focused}"
+
+    desktop-check-deps || return $?
+
+    # Get desktop ID
+    local desktop_id
+    desktop_id=$(bspwm-query-desktops "$selector" | head -n 1) || {
+        echo "Error: Failed to query desktop: $selector" >&2
+        return 1
+    }
+
+    if [[ -z "$desktop_id" ]]; then
+        echo "Error: Desktop not found: $selector" >&2
+        return 1
+    fi
+
+    # Get properties
+    local name monitor layout
+    name=$(bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "Unknown")
+    monitor=$(bspwm-desktop-get-property "$desktop_id" "monitor" 2>/dev/null || echo "Unknown")
+    layout=$(bspwm-desktop-get-property "$desktop_id" "layout" 2>/dev/null || echo "Unknown")
+
+    # Count windows
+    local nodes
+    nodes=$(bspwm-query-nodes -d "$desktop_id" 2>/dev/null || echo "")
+    local nodes_count
+    nodes_count=$(echo "$nodes" | grep -c . || echo "0")
+
+    echo "Desktop Information"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ID:          $desktop_id"
+    echo "Name:        $name"
+    echo "Monitor:     $monitor"
+    echo "Layout:      $layout"
+    echo "Windows:     $nodes_count"
+
+    return 0
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+desktop-main() {
+    local operation="${1:-}"
+
+    if [[ -z "$operation" ]] || [[ "$operation" == "-h" ]] || [[ "$operation" == "--help" ]]; then
+        desktop-help
+        return 0
+    fi
+
+    shift
+
+    case "$operation" in
+        focus|f)
+            desktop-op-focus "$@"
+            ;;
+        add|a|new)
+            desktop-op-add "$@"
+            ;;
+        remove|rm|delete)
+            desktop-op-remove "$@"
+            ;;
+        rename|rn)
+            desktop-op-rename "$@"
+            ;;
+        swap|sw)
+            desktop-op-swap "$@"
+            ;;
+        layout|l)
+            desktop-op-layout "$@"
+            ;;
+        move-window|move|mv)
+            desktop-op-move-window "$@"
+            ;;
+        list|ls)
+            desktop-op-list "$@"
+            ;;
+        info|show|i)
+            desktop-op-info "$@"
+            ;;
+        *)
+            echo "Error: Unknown operation: $operation" >&2
+            echo "" >&2
+            desktop-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+desktop-main "$@"

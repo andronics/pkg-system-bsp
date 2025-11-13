@@ -1,0 +1,230 @@
+#!/usr/bin/env zsh
+#
+# bsp-flag - Control flag reaction feature
+#
+# Usage: bsp flag <control> [args]
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+flag_usage() {
+    cat <<'EOF'
+Usage: bsp flag <control> [args]
+
+Control the flag reaction feature.
+
+Controls:
+  on                              Enable flag feature
+  off                             Disable flag feature
+  status                          Show feature status
+  config <flag> <key> [value]     Get or set flag configuration
+
+Flags:
+  marked, floating, hidden, sticky, locked, private
+
+Configuration Keys:
+  border_width                    Border width in pixels
+  border_color                    Border color in hex (e.g., #0000ff)
+
+Examples:
+  bsp flag on                                    # Enable feature
+  bsp flag status                                # Show current status
+  bsp flag config marked border_width 3          # Set marked border width
+  bsp flag config marked border_color "#0000ff"  # Set marked border color
+  bsp flag config floating border_width 2        # Set floating border width
+
+Supported Flag Behaviors:
+  marked:   Changes border width and color when window is marked
+  floating: Changes border width and color for floating windows
+  hidden:   Changes border width for hidden windows (typically 0)
+  sticky:   Changes border color for sticky windows
+  locked:   Changes border color for locked windows
+  private:  Changes border color for private windows
+
+Returns:
+  0 - Success
+  1 - Daemon not running or error
+  2 - Invalid arguments
+EOF
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+flag_enable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.flag.enabled" "true" || return 1
+    bsp-ui-success "Flag feature enabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+flag_disable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.flag.enabled" "false" || return 1
+    bsp-ui-success "Flag feature disabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+flag_status() {
+    # Phase 2: Read config directly (Phase 3 will use IPC)
+    local enabled=$(bsp-config-get "features.flag.enabled" "false")
+
+    bsp-ui-header "Flag Feature Status"
+    bsp-ui-status "Status" "$([ "$enabled" == "true" ] && echo "ENABLED" || echo "DISABLED")" "$([ "$enabled" == "true" ] && echo "success" || echo "warn")"
+    bsp-ui-status "Events" "node_flag"
+    echo ""
+    echo "Handled Flags:"
+    bsp-ui-status "  marked" "implemented"
+    bsp-ui-status "  floating" "implemented"
+    bsp-ui-status "  hidden" "implemented"
+    bsp-ui-status "  sticky" "implemented"
+    bsp-ui-status "  locked" "implemented"
+    bsp-ui-status "  private" "implemented"
+    echo ""
+    echo "Configuration:"
+    echo ""
+    echo "  marked:"
+    bsp-ui-status "    border_width" "$(bsp-config-get 'features.flag.marked.border_width' '3')"
+    bsp-ui-status "    border_color" "$(bsp-config-get 'features.flag.marked.border_color' '#0000ff')"
+    echo ""
+    echo "  floating:"
+    bsp-ui-status "    border_width" "$(bsp-config-get 'features.flag.floating.border_width' '2')"
+    bsp-ui-status "    border_color" "$(bsp-config-get 'features.flag.floating.border_color' '#00ff00')"
+    echo ""
+    echo "  hidden:"
+    bsp-ui-status "    border_width" "$(bsp-config-get 'features.flag.hidden.border_width' '0')"
+    echo ""
+    echo "  sticky:"
+    bsp-ui-status "    border_color" "$(bsp-config-get 'features.flag.sticky.border_color' '#ffff00')"
+    echo ""
+    echo "  locked:"
+    bsp-ui-status "    border_color" "$(bsp-config-get 'features.flag.locked.border_color' '#ff0000')"
+    echo ""
+    echo "  private:"
+    bsp-ui-status "    border_color" "$(bsp-config-get 'features.flag.private.border_color' '#ff00ff')"
+
+    return 0
+}
+
+flag_config() {
+    local flag_name="$1"
+    local key="$2"
+    local value="$3"
+
+    if [[ -z "$flag_name" ]]; then
+        # Show all config
+        echo "Flag Configuration:"
+        echo ""
+        flag_status
+        return 0
+    fi
+
+    # Validate flag name
+    case "$flag_name" in
+        marked|floating|hidden|sticky|locked|private)
+            ;;
+        *)
+            bsp-error "Invalid flag name: $flag_name" 2
+            echo "Valid flags: marked, floating, hidden, sticky, locked, private" >&2
+            return 2
+            ;;
+    esac
+
+    if [[ -z "$key" ]]; then
+        # Show flag-specific config
+        echo "Configuration for '$flag_name':"
+        echo "  border_width: $(bsp-config-get "features.flag.${flag_name}.border_width" 'N/A')"
+        echo "  border_color: $(bsp-config-get "features.flag.${flag_name}.border_color" 'N/A')"
+        return 0
+    fi
+
+    # Validate key
+    case "$key" in
+        border_width|border_color)
+            ;;
+        *)
+            bsp-error "Invalid config key: $key" 2
+            echo "Valid keys: border_width, border_color" >&2
+            return 2
+            ;;
+    esac
+
+    if [[ -z "$value" ]]; then
+        # Get config value
+        local current=$(bsp-config-get "features.flag.${flag_name}.${key}")
+        echo "$current"
+        return 0
+    else
+        # Set config value
+        bsp-config-set "features.flag.${flag_name}.${key}" "$value" || return 1
+        bsp-ui-success "Configuration updated: ${flag_name}.${key} = $value"
+        bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+        return 0
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+flag_main() {
+    local control="${1:-}"
+
+    if [[ -z "$control" ]]; then
+        flag_usage
+        return 2
+    fi
+
+    case "$control" in
+        on)
+            flag_enable
+            ;;
+        off)
+            flag_disable
+            ;;
+        status)
+            flag_status
+            ;;
+        config)
+            shift
+            flag_config "$@"
+            ;;
+        -h|--help|help)
+            flag_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid control: $control" 2
+            echo "" >&2
+            flag_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+flag_main "$@"

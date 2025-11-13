@@ -1,0 +1,401 @@
+#!/usr/bin/env zsh
+#
+# bsp-monitor - Monitor operations command
+#
+# User-friendly wrappers for bspwm monitor operations:
+# - Focus monitors
+# - Add/remove monitors
+# - Rename monitors
+# - Swap monitors
+# - Move desktops between monitors
+#
+# Usage: bsp monitor <operation> [args]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_BSPWM=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+monitor-help() {
+    cat <<'EOF'
+Usage: bsp monitor <operation> [args]
+
+Monitor operations for bspwm.
+
+Operations:
+  focus <selector>              Focus monitor
+  add <name> <geometry>         Add new monitor (rare)
+  remove <selector>             Remove monitor (rare)
+  rename <selector> <name>      Rename monitor
+  swap <sel1> <sel2>            Swap two monitors
+  move-desktop <desktop> <mon>  Move desktop to monitor
+  list                          List all monitors
+  info <selector>               Show monitor information
+
+Selectors:
+  .focused                      Focused monitor
+  .last                         Last focused monitor
+  .primary                      Primary monitor
+  .next                         Next monitor
+  .prev                         Previous monitor
+  ^N                            Monitor N
+  <name>                        Monitor by name
+
+Options:
+  -h, --help                    Show this help message
+
+Examples:
+  bsp monitor focus eDP-1       # Focus monitor eDP-1
+  bsp monitor rename ^1 primary # Rename first monitor
+  bsp monitor swap ^1 ^2        # Swap monitors
+  bsp monitor move-desktop 2 ^2 # Move desktop 2 to monitor 2
+  bsp monitor list              # List all monitors
+  bsp monitor info .focused     # Show focused monitor info
+
+Returns:
+  0 - Success
+  1 - Error
+  2 - Invalid arguments
+
+EOF
+}
+
+# Check dependencies
+monitor-check-deps() {
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        return 1
+    fi
+
+    if ! command -v bspc &>/dev/null; then
+        echo "Error: bspc not found" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# OPERATION IMPLEMENTATIONS
+# ============================================================================
+
+monitor-op-focus() {
+    local selector="${1:-.focused}"
+
+    monitor-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Focusing monitor" "selector=$selector"
+
+    bspc monitor "$selector" --focus || {
+        echo "Error: Failed to focus monitor: $selector" >&2
+        return 1
+    }
+
+    echo "Focused monitor: $selector"
+    return 0
+}
+
+monitor-op-add() {
+    local name="${1:-}"
+    local geometry="${2:-}"
+
+    if [[ -z "$name" ]] || [[ -z "$geometry" ]]; then
+        echo "Error: Monitor name and geometry required" >&2
+        echo "Usage: bsp monitor add <name> <geometry>" >&2
+        echo "Example: bsp monitor add HDMI-2 1920x1080+1920+0" >&2
+        return 2
+    fi
+
+    monitor-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Adding monitor" "name=$name geometry=$geometry"
+
+    bspc monitor "$name" --add-desktops "Desktop" || {
+        echo "Error: Failed to add monitor: $name" >&2
+        return 1
+    }
+
+    echo "Added monitor: $name ($geometry)"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "monitor:added" "name=$name"
+
+    return 0
+}
+
+monitor-op-remove() {
+    local selector="${1:-}"
+
+    if [[ -z "$selector" ]]; then
+        echo "Error: Monitor selector required" >&2
+        echo "Usage: bsp monitor remove <selector>" >&2
+        return 2
+    fi
+
+    monitor-check-deps || return $?
+
+    # Confirm
+    local monitor_name
+    monitor_name=$(bspwm-monitor-get-property "$selector" "name" 2>/dev/null || echo "$selector")
+
+    read -q "REPLY?Remove monitor '$monitor_name'? (y/n) " || {
+        echo ""
+        echo "Cancelled"
+        return 0
+    }
+    echo ""
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Removing monitor" "selector=$selector"
+
+    bspc monitor "$selector" --remove || {
+        echo "Error: Failed to remove monitor: $selector" >&2
+        return 1
+    }
+
+    echo "Removed monitor: $monitor_name"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "monitor:removed" "name=$monitor_name"
+
+    return 0
+}
+
+monitor-op-rename() {
+    local selector="${1:-}"
+    local new_name="${2:-}"
+
+    if [[ -z "$selector" ]] || [[ -z "$new_name" ]]; then
+        echo "Error: Monitor selector and new name required" >&2
+        echo "Usage: bsp monitor rename <selector> <name>" >&2
+        return 2
+    fi
+
+    monitor-check-deps || return $?
+
+    local old_name
+    old_name=$(bspwm-monitor-get-property "$selector" "name" 2>/dev/null || echo "$selector")
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Renaming monitor" "from=$old_name to=$new_name"
+
+    bspc monitor "$selector" --rename "$new_name" || {
+        echo "Error: Failed to rename monitor: $selector" >&2
+        return 1
+    }
+
+    echo "Renamed monitor: $old_name -> $new_name"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "monitor:renamed" "from=$old_name to=$new_name"
+
+    return 0
+}
+
+monitor-op-swap() {
+    local sel1="${1:-}"
+    local sel2="${2:-}"
+
+    if [[ -z "$sel1" ]] || [[ -z "$sel2" ]]; then
+        echo "Error: Two monitor selectors required" >&2
+        echo "Usage: bsp monitor swap <selector1> <selector2>" >&2
+        return 2
+    fi
+
+    monitor-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Swapping monitors" "sel1=$sel1 sel2=$sel2"
+
+    bspc monitor "$sel1" --swap "$sel2" || {
+        echo "Error: Failed to swap monitors" >&2
+        return 1
+    }
+
+    echo "Swapped monitors: $sel1 <-> $sel2"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "monitor:swapped" "sel1=$sel1 sel2=$sel2"
+
+    return 0
+}
+
+monitor-op-move-desktop() {
+    local desktop="${1:-}"
+    local monitor="${2:-}"
+
+    if [[ -z "$desktop" ]] || [[ -z "$monitor" ]]; then
+        echo "Error: Desktop and monitor selectors required" >&2
+        echo "Usage: bsp monitor move-desktop <desktop> <monitor>" >&2
+        return 2
+    fi
+
+    monitor-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Moving desktop to monitor" "desktop=$desktop monitor=$monitor"
+
+    bspc desktop "$desktop" --to-monitor "$monitor" || {
+        echo "Error: Failed to move desktop to monitor" >&2
+        return 1
+    }
+
+    echo "Moved desktop '$desktop' to monitor '$monitor'"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "monitor:desktop-moved" "desktop=$desktop monitor=$monitor"
+
+    return 0
+}
+
+monitor-op-list() {
+    monitor-check-deps || return $?
+
+    # Get all monitors
+    local monitors
+    monitors=$(bspwm-query-monitors) || {
+        echo "Error: Failed to query monitors" >&2
+        return 1
+    }
+
+    if [[ -z "$monitors" ]]; then
+        echo "No monitors found"
+        return 0
+    fi
+
+    echo "Monitors:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local focused_monitor
+    focused_monitor=$(bspwm-query-monitors ".focused" 2>/dev/null)
+
+    while IFS= read -r monitor_id; do
+        local name desktops_count
+        name=$(bspwm-monitor-get-property "$monitor_id" "name" 2>/dev/null || echo "?")
+
+        # Count desktops
+        local desktops
+        desktops=$(bspwm-query-desktops -m "$monitor_id" 2>/dev/null || echo "")
+        desktops_count=$(echo "$desktops" | grep -c . || echo "0")
+
+        # Determine if focused
+        local focus_marker=""
+        if [[ "$monitor_id" == "$focused_monitor" ]]; then
+            focus_marker="*"
+        else
+            focus_marker=" "
+        fi
+
+        printf "  [%s] %-15s  Desktops: %d\n" \
+            "$focus_marker" "$name" "$desktops_count"
+    done <<< "$monitors"
+
+    return 0
+}
+
+monitor-op-info() {
+    local selector="${1:-.focused}"
+
+    monitor-check-deps || return $?
+
+    # Get monitor ID
+    local monitor_id
+    monitor_id=$(bspwm-query-monitors "$selector" | head -n 1) || {
+        echo "Error: Failed to query monitor: $selector" >&2
+        return 1
+    }
+
+    if [[ -z "$monitor_id" ]]; then
+        echo "Error: Monitor not found: $selector" >&2
+        return 1
+    fi
+
+    # Get properties
+    local name
+    name=$(bspwm-monitor-get-property "$monitor_id" "name" 2>/dev/null || echo "Unknown")
+
+    # Count desktops
+    local desktops
+    desktops=$(bspwm-query-desktops -m "$monitor_id" 2>/dev/null || echo "")
+    local desktops_count
+    desktops_count=$(echo "$desktops" | grep -c . || echo "0")
+
+    echo "Monitor Information"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ID:          $monitor_id"
+    echo "Name:        $name"
+    echo "Desktops:    $desktops_count"
+
+    return 0
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+monitor-main() {
+    local operation="${1:-}"
+
+    if [[ -z "$operation" ]] || [[ "$operation" == "-h" ]] || [[ "$operation" == "--help" ]]; then
+        monitor-help
+        return 0
+    fi
+
+    shift
+
+    case "$operation" in
+        focus|f)
+            monitor-op-focus "$@"
+            ;;
+        add|a|new)
+            monitor-op-add "$@"
+            ;;
+        remove|rm|delete)
+            monitor-op-remove "$@"
+            ;;
+        rename|rn)
+            monitor-op-rename "$@"
+            ;;
+        swap|sw)
+            monitor-op-swap "$@"
+            ;;
+        move-desktop|move|mv)
+            monitor-op-move-desktop "$@"
+            ;;
+        list|ls)
+            monitor-op-list "$@"
+            ;;
+        info|show|i)
+            monitor-op-info "$@"
+            ;;
+        *)
+            echo "Error: Unknown operation: $operation" >&2
+            echo "" >&2
+            monitor-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+monitor-main "$@"

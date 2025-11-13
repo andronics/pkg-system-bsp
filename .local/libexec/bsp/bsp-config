@@ -1,0 +1,311 @@
+#!/usr/bin/env zsh
+#
+# bsp-config - Configuration management for bsp package
+#
+# Usage: bsp config <subcommand> [options]
+#
+# Manage BSP configuration
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+source "$SCRIPT_DIR/bsp-ipc"
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+config-help() {
+    cat <<'EOF'
+Usage: bsp config <subcommand> [options]
+
+Configuration Management for BSP
+
+SUBCOMMANDS:
+  get <key>             Get configuration value
+  set <key> <value>     Set configuration value
+  list                  List all configuration
+  validate              Validate configuration syntax
+  edit                  Edit configuration in $EDITOR
+  reset                 Reset to default configuration
+  path                  Show configuration file path
+
+OPTIONS:
+  -h, --help           Show this help message
+  --json               Output in JSON format
+
+EXAMPLES:
+  bsp config get features.balance.enabled
+  bsp config set features.balance.strategy equal
+  bsp config list
+  bsp config validate
+  bsp config edit
+  bsp config path
+
+CONFIGURATION STRUCTURE:
+  features.<feature>.enabled         Enable/disable feature
+  features.<feature>.strategy        Feature-specific strategy
+  features.<feature>.events          Events to subscribe to
+  ipc.socket                         IPC socket path
+  ipc.timeout                        IPC timeout (seconds)
+  logging.level                      Log level (DEBUG/INFO/WARN/ERROR)
+  logging.file                       Log file path
+  cache.enabled                      Enable caching
+  cache.ttl.*                        Cache TTL for different queries
+  notifications.enabled              Enable notifications
+
+NOTES:
+  - Changes require daemon reload
+  - Use --json for machine-readable output
+  - Invalid JSON will be rejected
+EOF
+}
+
+# ============================================================================
+# SUBCOMMAND IMPLEMENTATIONS
+# ============================================================================
+
+config-get() {
+    local key="${1:-}"
+    local format="${2:-human}"
+
+    # Use IPC if daemon is running
+    if bsp-daemon-running && ipc-available; then
+        local response
+        if [[ -n "$key" ]]; then
+            response=$(ipc-send-simple "config.get" "$key" 2>/dev/null)
+        else
+            response=$(ipc-send-simple "config.get" 2>/dev/null)
+        fi
+
+        if [[ $? -eq 0 ]]; then
+            if [[ "$format" == "json" ]]; then
+                echo "$response"
+            else
+                echo "$response" | jq -r '.' 2>/dev/null || echo "$response"
+            fi
+            return 0
+        fi
+    fi
+
+    # Fallback: read from config file
+    if [[ -z "$key" ]]; then
+        # Return entire config
+        if [[ "$format" == "json" ]]; then
+            cat "$BSP_CONFIG_FILE"
+        else
+            jq -C '.' "$BSP_CONFIG_FILE" 2>/dev/null || cat "$BSP_CONFIG_FILE"
+        fi
+    else
+        # Return specific key
+        local value
+        value=$(bsp-config-get "$key" "")
+
+        if [[ -n "$value" ]]; then
+            echo "$value"
+        else
+            bsp-log-error "Key not found: $key"
+            return 1
+        fi
+    fi
+}
+
+config-set() {
+    local key="$1"
+    local value="$2"
+
+    if [[ -z "$key" ]] || [[ -z "$value" ]]; then
+        bsp-log-error "Missing key or value"
+        echo "Usage: bsp config set <key> <value>"
+        return 2
+    fi
+
+    # Use IPC if daemon is running
+    if bsp-daemon-running && ipc-available; then
+        local response
+        response=$(ipc-send-simple "config.set" "$key" "$value" 2>/dev/null)
+
+        if [[ $? -eq 0 ]]; then
+            bsp-ui-success "Configuration updated: $key = $value"
+            return 0
+        fi
+    fi
+
+    # Fallback: update config directly
+    if bsp-config-set "$key" "$value"; then
+        bsp-ui-success "Configuration updated: $key = $value"
+        bsp-ui-info "Reload daemon to apply changes: bsp daemon reload"
+        return 0
+    else
+        bsp-log-error "Failed to update configuration"
+        return 1
+    fi
+}
+
+config-list() {
+    local format="${1:-human}"
+
+    config-get "" "$format"
+}
+
+config-validate() {
+    # Use IPC if daemon is running
+    if bsp-daemon-running && ipc-available; then
+        local response
+        response=$(ipc-send-simple "config.validate" 2>/dev/null)
+
+        if [[ $? -eq 0 ]]; then
+            local valid
+            valid=$(echo "$response" | jq -r '.valid // false')
+
+            if [[ "$valid" == "true" ]]; then
+                bsp-ui-success "Configuration is valid"
+                return 0
+            else
+                bsp-ui-error "Configuration is invalid"
+                echo "$response" | jq -r '.errors[]' 2>/dev/null
+                return 1
+            fi
+        fi
+    fi
+
+    # Fallback: validate directly
+    if bsp-config-validate; then
+        bsp-ui-success "Configuration is valid"
+        return 0
+    else
+        bsp-ui-error "Configuration is invalid"
+        return 1
+    fi
+}
+
+config-edit() {
+    local editor="${EDITOR:-vi}"
+
+    if [[ ! -f "$BSP_CONFIG_FILE" ]]; then
+        bsp-log-error "Configuration file not found: $BSP_CONFIG_FILE"
+        return 1
+    fi
+
+    # Open in editor
+    "$editor" "$BSP_CONFIG_FILE"
+
+    # Validate after editing
+    echo ""
+    bsp-ui-info "Validating configuration..."
+
+    if config-validate; then
+        bsp-ui-info "Reload daemon to apply changes: bsp daemon reload"
+    else
+        bsp-ui-error "Configuration has errors. Please fix before reloading daemon."
+        return 1
+    fi
+}
+
+config-reset() {
+    # Confirm reset
+    echo "This will reset configuration to defaults."
+    echo -n "Are you sure? [y/N] "
+    read -r confirm
+
+    if [[ "$confirm" != "y" ]] && [[ "$confirm" != "Y" ]]; then
+        bsp-ui-info "Reset cancelled"
+        return 0
+    fi
+
+    # Backup current config
+    local backup="${BSP_CONFIG_FILE}.backup.$(date +%s)"
+    cp "$BSP_CONFIG_FILE" "$backup"
+    bsp-ui-info "Backed up current configuration to: $backup"
+
+    # Create default config
+    bsp-common-create-default-config
+
+    bsp-ui-success "Configuration reset to defaults"
+    bsp-ui-info "Reload daemon to apply changes: bsp daemon reload"
+}
+
+config-path() {
+    echo "$BSP_CONFIG_FILE"
+}
+
+# ============================================================================
+# MAIN DISPATCHER
+# ============================================================================
+
+config-main() {
+    local subcommand="${1:-list}"
+    shift || true
+
+    # Parse global options
+    local format="human"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                config-help
+                return 0
+                ;;
+            --json)
+                format="json"
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                config-help
+                return 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # Dispatch subcommand
+    case "$subcommand" in
+        get)
+            config-get "${1:-}" "$format"
+            ;;
+        set)
+            config-set "$@"
+            ;;
+        list|ls)
+            config-list "$format"
+            ;;
+        validate|check)
+            config-validate
+            ;;
+        edit)
+            config-edit
+            ;;
+        reset)
+            config-reset
+            ;;
+        path)
+            config-path
+            ;;
+        -h|--help|help)
+            config-help
+            ;;
+        *)
+            echo "Error: Unknown subcommand: $subcommand" >&2
+            echo ""
+            config-help
+            return 2
+            ;;
+    esac
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+config-main "$@"

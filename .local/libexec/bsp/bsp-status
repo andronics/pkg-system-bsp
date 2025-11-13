@@ -1,0 +1,545 @@
+#!/usr/bin/env zsh
+#
+# bsp-status - Comprehensive status display for bsp package
+#
+# Usage: bsp status [options]
+#
+# Show status of daemon, features, windows, desktops, and system
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+source "$SCRIPT_DIR/bsp-ipc"
+
+# Load _bspwm library
+if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+    source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm"
+else
+    echo "Error: _bspwm library not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+status-help() {
+    cat <<'EOF'
+Usage: bsp status [options]
+
+Comprehensive Status Display for BSP
+
+Shows detailed status information about:
+  - Daemon status (running, PID, uptime)
+  - Feature status (enabled/disabled, statistics)
+  - Window manager status (windows, desktops, monitors)
+  - System status (bspwm version, configuration)
+
+OPTIONS:
+  -h, --help           Show this help message
+  --json               Output in JSON format
+  --watch              Watch mode (update every 2 seconds)
+  --daemon             Show only daemon status
+  --features           Show only features status
+  --wm                 Show only window manager status
+  --all                Show all status (default)
+
+EXAMPLES:
+  bsp status                  # Show all status
+  bsp status --daemon         # Show only daemon status
+  bsp status --watch          # Watch mode (live updates)
+  bsp status --json           # JSON output
+
+NOTES:
+  - Requires daemon to be running for full status
+  - Use --watch for live monitoring
+  - Use --json for machine-readable output
+EOF
+}
+
+# ============================================================================
+# STATUS GATHERING
+# ============================================================================
+
+status-get-daemon() {
+    local daemon_pid=""
+    local daemon_running=false
+    local daemon_uptime=""
+    local ipc_available=false
+
+    # Check if daemon is running
+    if [[ -f "$BSP_DAEMON_PIDFILE" ]]; then
+        daemon_pid=$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null || echo "")
+
+        if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+            daemon_running=true
+
+            # Calculate uptime
+            if [[ -f "/proc/$daemon_pid/stat" ]]; then
+                local start_time
+                start_time=$(awk '{print $22}' "/proc/$daemon_pid/stat")
+                local uptime_sec
+                uptime_sec=$(awk '{print int($1)}' /proc/uptime)
+                local clock_ticks
+                clock_ticks=$(getconf CLK_TCK)
+                local process_uptime
+                process_uptime=$((uptime_sec - start_time / clock_ticks))
+                daemon_uptime=$(bsp-format-uptime "$process_uptime")
+            else
+                daemon_uptime="unknown"
+            fi
+        fi
+    fi
+
+    # Check IPC availability
+    if [[ -S "$BSP_DAEMON_SOCKET" ]]; then
+        ipc_available=true
+    fi
+
+    # Build JSON
+    jq -n \
+        --argjson running "$daemon_running" \
+        --arg pid "$daemon_pid" \
+        --arg uptime "$daemon_uptime" \
+        --argjson ipc_available "$ipc_available" \
+        --arg socket "$BSP_DAEMON_SOCKET" \
+        '{
+            running: $running,
+            pid: $pid,
+            uptime: $uptime,
+            ipc: {
+                available: $ipc_available,
+                socket: $socket
+            }
+        }'
+}
+
+status-get-features() {
+    local features=()
+
+    for feature in balance desktops flag floating-borders ventilate; do
+        local enabled
+        enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+        # Get feature-specific stats
+        local stats="{}"
+
+        case "$feature" in
+            balance)
+                local strategy
+                strategy=$(bsp-config-get "features.balance.strategy" "equal")
+                stats=$(jq -n --arg strategy "$strategy" '{strategy: $strategy}')
+                ;;
+            desktops)
+                local start_id
+                local auto_naming
+                start_id=$(bsp-config-get "features.desktops.start_id" "1")
+                auto_naming=$(bsp-config-get "features.desktops.auto_naming" "false")
+                stats=$(jq -n \
+                    --arg start_id "$start_id" \
+                    --arg auto_naming "$auto_naming" \
+                    '{start_id: $start_id, auto_naming: ($auto_naming == "true")}')
+                ;;
+            ventilate)
+                local terminals_count
+                terminals_count=$(bsp-config-get "features.ventilate.terminals" "[]" | jq -r '. | length' 2>/dev/null || echo "0")
+                stats=$(jq -n --arg terminals_count "$terminals_count" '{terminals_count: $terminals_count}')
+                ;;
+        esac
+
+        features+=($(jq -n \
+            --arg name "$feature" \
+            --arg enabled "$enabled" \
+            --argjson stats "$stats" \
+            '{name: $name, enabled: ($enabled == "true"), stats: $stats}'))
+    done
+
+    printf '%s\n' "${features[@]}" | jq -s '.'
+}
+
+status-get-wm() {
+    # Check if bspwm is running
+    if ! bspwm-is-running; then
+        jq -n '{running: false}'
+        return
+    fi
+
+    # Get window manager stats
+    local nodes_count
+    local desktops_count
+    local monitors_count
+    local focused_node
+    local focused_desktop
+
+    nodes_count=$(bspwm-query-nodes --names | wc -l)
+    desktops_count=$(bspwm-query-desktops --names | wc -l)
+    monitors_count=$(bspwm-query-monitors --names | wc -l)
+    focused_node=$(bspwm-query-nodes -n focused --names 2>/dev/null || echo "")
+    focused_desktop=$(bspwm-query-desktops -d focused --names 2>/dev/null || echo "")
+
+    jq -n \
+        --argjson running true \
+        --arg nodes_count "$nodes_count" \
+        --arg desktops_count "$desktops_count" \
+        --arg monitors_count "$monitors_count" \
+        --arg focused_node "$focused_node" \
+        --arg focused_desktop "$focused_desktop" \
+        '{
+            running: $running,
+            nodes: {
+                count: ($nodes_count | tonumber)
+            },
+            desktops: {
+                count: ($desktops_count | tonumber),
+                focused: $focused_desktop
+            },
+            monitors: {
+                count: ($monitors_count | tonumber)
+            }
+        }'
+}
+
+status-get-system() {
+    local bspwm_version=""
+    local config_file="$BSP_CONFIG_FILE"
+    local config_valid=false
+
+    # Get bspwm version
+    if command -v bspc &>/dev/null; then
+        bspwm_version=$(bspc --version 2>/dev/null || echo "unknown")
+    fi
+
+    # Check config validity
+    if bsp-config-validate 2>/dev/null; then
+        config_valid=true
+    fi
+
+    jq -n \
+        --arg bspwm_version "$bspwm_version" \
+        --arg config_file "$config_file" \
+        --argjson config_valid "$config_valid" \
+        '{
+            bspwm_version: $bspwm_version,
+            config: {
+                file: $config_file,
+                valid: $config_valid
+            }
+        }'
+}
+
+status-get-all() {
+    local daemon
+    local features
+    local wm
+    local system
+
+    daemon=$(status-get-daemon)
+    features=$(status-get-features)
+    wm=$(status-get-wm)
+    system=$(status-get-system)
+
+    jq -n \
+        --argjson daemon "$daemon" \
+        --argjson features "$features" \
+        --argjson wm "$wm" \
+        --argjson system "$system" \
+        '{
+            daemon: $daemon,
+            features: $features,
+            wm: $wm,
+            system: $system
+        }'
+}
+
+# ============================================================================
+# STATUS DISPLAY
+# ============================================================================
+
+status-display-daemon() {
+    local data="$1"
+
+    bsp-ui-header "Daemon Status"
+
+    local running
+    local pid
+    local uptime
+    local ipc_available
+
+    running=$(echo "$data" | jq -r '.running // false')
+    pid=$(echo "$data" | jq -r '.pid // ""')
+    uptime=$(echo "$data" | jq -r '.uptime // ""')
+    ipc_available=$(echo "$data" | jq -r '.ipc.available // false')
+
+    if [[ "$running" == "true" ]]; then
+        bsp-ui-status "Status" "running" "success"
+        bsp-ui-status "PID" "$pid" "info"
+        bsp-ui-status "Uptime" "$uptime" "info"
+    else
+        bsp-ui-status "Status" "stopped" "error"
+    fi
+
+    if [[ "$ipc_available" == "true" ]]; then
+        bsp-ui-status "IPC" "available" "success"
+    else
+        bsp-ui-status "IPC" "unavailable" "error"
+    fi
+
+    echo ""
+}
+
+status-display-features() {
+    local data="$1"
+
+    bsp-ui-header "Features Status"
+
+    echo "$data" | jq -r '.[] | "\(.name)|\(.enabled)|\(.stats | tostring)"' | while IFS='|' read -r name enabled stats; do
+        if [[ "$enabled" == "true" ]]; then
+            bsp-ui-status "$name" "enabled" "success"
+
+            # Show feature-specific stats
+            case "$name" in
+                balance)
+                    local strategy
+                    strategy=$(echo "$stats" | jq -r '.strategy // ""')
+                    if [[ -n "$strategy" ]]; then
+                        printf "    Strategy: %s\n" "$strategy"
+                    fi
+                    ;;
+                desktops)
+                    local auto_naming
+                    auto_naming=$(echo "$stats" | jq -r '.auto_naming // false')
+                    printf "    Auto-naming: %s\n" "$auto_naming"
+                    ;;
+                ventilate)
+                    local terminals_count
+                    terminals_count=$(echo "$stats" | jq -r '.terminals_count // 0')
+                    printf "    Terminals: %s\n" "$terminals_count"
+                    ;;
+            esac
+        else
+            bsp-ui-status "$name" "disabled" "error"
+        fi
+    done
+
+    echo ""
+}
+
+status-display-wm() {
+    local data="$1"
+
+    bsp-ui-header "Window Manager Status"
+
+    local running
+    running=$(echo "$data" | jq -r '.running // false')
+
+    if [[ "$running" == "true" ]]; then
+        bsp-ui-status "bspwm" "running" "success"
+
+        local nodes_count
+        local desktops_count
+        local monitors_count
+        local focused_desktop
+
+        nodes_count=$(echo "$data" | jq -r '.nodes.count // 0')
+        desktops_count=$(echo "$data" | jq -r '.desktops.count // 0')
+        monitors_count=$(echo "$data" | jq -r '.monitors.count // 0')
+        focused_desktop=$(echo "$data" | jq -r '.desktops.focused // ""')
+
+        bsp-ui-status "Monitors" "$monitors_count" "info"
+        bsp-ui-status "Desktops" "$desktops_count" "info"
+        bsp-ui-status "Windows" "$nodes_count" "info"
+
+        if [[ -n "$focused_desktop" ]]; then
+            bsp-ui-status "Focused Desktop" "$focused_desktop" "info"
+        fi
+    else
+        bsp-ui-status "bspwm" "not running" "error"
+    fi
+
+    echo ""
+}
+
+status-display-system() {
+    local data="$1"
+
+    bsp-ui-header "System Information"
+
+    local bspwm_version
+    local config_file
+    local config_valid
+
+    bspwm_version=$(echo "$data" | jq -r '.bspwm_version // "unknown"')
+    config_file=$(echo "$data" | jq -r '.config.file // ""')
+    config_valid=$(echo "$data" | jq -r '.config.valid // false')
+
+    bsp-ui-status "bspwm Version" "$bspwm_version" "info"
+    bsp-ui-status "Config File" "$config_file" "info"
+
+    if [[ "$config_valid" == "true" ]]; then
+        bsp-ui-status "Config Valid" "yes" "success"
+    else
+        bsp-ui-status "Config Valid" "no" "error"
+    fi
+
+    echo ""
+}
+
+status-display-all() {
+    local data="$1"
+
+    local daemon
+    local features
+    local wm
+    local system
+
+    daemon=$(echo "$data" | jq -r '.daemon')
+    features=$(echo "$data" | jq -r '.features')
+    wm=$(echo "$data" | jq -r '.wm')
+    system=$(echo "$data" | jq -r '.system')
+
+    status-display-daemon "$daemon"
+    status-display-features "$features"
+    status-display-wm "$wm"
+    status-display-system "$system"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+status-main() {
+    # Parse options
+    local format="human"
+    local watch_mode=false
+    local show_daemon=false
+    local show_features=false
+    local show_wm=false
+    local show_all=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                status-help
+                return 0
+                ;;
+            --json)
+                format="json"
+                shift
+                ;;
+            --watch)
+                watch_mode=true
+                shift
+                ;;
+            --daemon)
+                show_daemon=true
+                show_all=false
+                shift
+                ;;
+            --features)
+                show_features=true
+                show_all=false
+                shift
+                ;;
+            --wm)
+                show_wm=true
+                show_all=false
+                shift
+                ;;
+            --all)
+                show_all=true
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                status-help
+                return 2
+                ;;
+            *)
+                echo "Error: Unknown argument: $1" >&2
+                status-help
+                return 2
+                ;;
+        esac
+    done
+
+    # Watch mode
+    if [[ "$watch_mode" == "true" ]]; then
+        while true; do
+            clear
+            echo "BSP Status ($(date '+%Y-%m-%d %H:%M:%S'))"
+            echo ""
+
+            if [[ "$show_all" == "true" ]]; then
+                local data
+                data=$(status-get-all)
+                status-display-all "$data"
+            else
+                [[ "$show_daemon" == "true" ]] && status-display-daemon "$(status-get-daemon)"
+                [[ "$show_features" == "true" ]] && status-display-features "$(status-get-features)"
+                [[ "$show_wm" == "true" ]] && status-display-wm "$(status-get-wm)"
+            fi
+
+            sleep 2
+        done
+        return 0
+    fi
+
+    # Single display
+    if [[ "$show_all" == "true" ]]; then
+        local data
+        data=$(status-get-all)
+
+        if [[ "$format" == "json" ]]; then
+            echo "$data" | jq -C '.'
+        else
+            status-display-all "$data"
+        fi
+    else
+        if [[ "$show_daemon" == "true" ]]; then
+            local data
+            data=$(status-get-daemon)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                status-display-daemon "$data"
+            fi
+        fi
+
+        if [[ "$show_features" == "true" ]]; then
+            local data
+            data=$(status-get-features)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                status-display-features "$data"
+            fi
+        fi
+
+        if [[ "$show_wm" == "true" ]]; then
+            local data
+            data=$(status-get-wm)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                status-display-wm "$data"
+            fi
+        fi
+    fi
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+status-main "$@"

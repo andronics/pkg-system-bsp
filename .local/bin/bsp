@@ -1,0 +1,267 @@
+#!/usr/bin/env zsh
+#
+# bsp - Binary Space Partitioning Window Manager Utilities
+#
+# Unified CLI dispatcher for bspwm utilities and daemon management.
+# Git-like command structure with subcommand routing to libexec helpers.
+#
+# Usage: bsp <command> [options] [args]
+#
+# Architecture: Git-like dispatcher with unified daemon
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Package metadata
+readonly BSP_VERSION="2.0.0"
+readonly BSP_BUILD_DATE="2025-11-07"
+
+# Determine directories
+SCRIPT_DIR="${0:A:h}"
+LIBEXEC_DIR="${SCRIPT_DIR:h}/libexec/bsp"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bsp"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bsp"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bsp"
+
+# Ensure directories exist
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$STATE_DIR"
+
+# Global options
+DEBUG_MODE=false
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# ============================================================================
+# LIBRARY LOADING (Optional Dependencies)
+# ============================================================================
+
+# Feature flags
+_HAS_LOG=false
+_HAS_SINGLETON=false
+_HAS_LIFECYCLE=false
+_HAS_EVENTS=false
+_HAS_CACHE=false
+_HAS_CONFIG=false
+_HAS_BSPWM=false
+
+# Attempt to load libraries (graceful degradation if not found)
+# Note: Libraries may not exist yet in Phase 1, these will be mocked/stubbed
+
+# Try to load _bspwm library (Phase 1 deliverable)
+if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+    source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" && _HAS_BSPWM=true
+fi
+
+# Try to load other libraries (may not exist in Phase 1)
+# for lib in _log _singleton _lifecycle _events _cache _config; do
+#     if source "$(which $lib)" 2>/dev/null; then
+#         case "$lib" in
+#             _log) _HAS_LOG=true ;;
+#             _singleton) _HAS_SINGLETON=true ;;
+#             _lifecycle) _HAS_LIFECYCLE=true ;;
+#             _events) _HAS_EVENTS=true ;;
+#             _cache) _HAS_CACHE=true ;;
+#             _config) _HAS_CONFIG=true ;;
+#         esac
+#     fi
+# done
+
+# Minimal logging fallback
+_log_debug() {
+    [[ "$DEBUG_MODE" == "true" ]] && echo "[DEBUG] $*" >&2
+}
+
+_log_info() {
+    echo "[INFO] $*" >&2
+}
+
+_log_warn() {
+    echo "[WARN] $*" >&2
+}
+
+_log_error() {
+    echo "[ERROR] $*" >&2
+}
+
+# ============================================================================
+# USAGE AND HELP
+# ============================================================================
+
+bsp-usage() {
+    cat <<'EOF'
+BSP - Binary Space Partitioning Window Manager Utilities
+
+Usage: bsp <command> [options] [args]
+
+Daemon Management:
+  daemon start             Start the unified daemon
+  daemon stop              Stop the daemon
+  daemon restart           Restart the daemon
+  daemon status            Show daemon status
+  daemon reload            Reload configuration
+
+Feature Control:
+  features list            List all features
+  features enable <name>   Enable a feature
+  features disable <name>  Disable a feature
+  features status [name]   Show feature status
+
+  balance on|off|status|trigger    Auto-balance window tree
+  desktops on|off|status           Dynamic desktop management
+  flag on|off|status               React to window flag changes
+  floating-borders on|off|status   Remove borders from floating windows (deprecated, use features)
+  ventilate on|off|status          Terminal window swallowing
+
+Direct Commands:
+  side <direction>         Place window directionally (west|north|east|south)
+  shroud cover|reveal      Hide/show windows and polybar
+  fullscreen               Toggle fullscreen
+
+Configuration & Monitoring:
+  config get <key>         Get configuration value
+  config set <key> <val>   Set configuration value
+  config list              List all configuration
+  config validate          Validate configuration
+  config edit              Edit configuration file
+
+  status [options]         Show comprehensive status
+  info [options]           Show system information
+  tree [options]           Visualize window tree
+  events [options]         Monitor live events
+
+Layout Management:
+  layout list              List available layouts
+  layout save <name>       Save current layout
+  layout load <name>       Load layout
+  layout apply <name>      Apply layout to desktop
+  layout delete <name>     Delete layout
+
+Global Options:
+  -h, --help               Show this help
+  -v, --version            Show version
+  --debug                  Enable debug output
+  --config <file>          Use alternate config file
+
+See 'bsp help <command>' for more information on a specific command.
+EOF
+}
+
+bsp-version() {
+    cat <<EOF
+bsp version $BSP_VERSION
+Build: $BSP_BUILD_DATE
+bspwm version: $(bspwm-version 2>/dev/null || echo "not found")
+EOF
+}
+
+# ============================================================================
+# COMMAND DISPATCHER
+# ============================================================================
+
+bsp-dispatch() {
+    local command="$1"
+    shift || true
+
+    # Handle empty command
+    if [[ -z "$command" ]]; then
+        bsp-usage
+        return 1
+    fi
+
+    # Handle global options
+    case "$command" in
+        -h|--help|help)
+            if [[ $# -eq 0 ]]; then
+                bsp-usage
+                return 0
+            else
+                # Help for specific command
+                local help_cmd="$1"
+                local subcommand_path="$LIBEXEC_DIR/bsp-${help_cmd}"
+
+                if [[ -x "$subcommand_path" ]]; then
+                    "$subcommand_path" --help
+                else
+                    echo "Error: Unknown command: $help_cmd" >&2
+                    echo "" >&2
+                    bsp-usage
+                    return 1
+                fi
+            fi
+            ;;
+        -v|--version|version)
+            bsp-version
+            return 0
+            ;;
+        --debug)
+            DEBUG_MODE=true
+            _log_debug "Debug mode enabled"
+            # Continue to next command
+            bsp-dispatch "$@"
+            return $?
+            ;;
+        --config)
+            if [[ $# -eq 0 ]]; then
+                echo "Error: --config requires a file argument" >&2
+                return 2
+            fi
+            CONFIG_FILE="$1"
+            shift
+            _log_debug "Using config file: $CONFIG_FILE"
+            # Continue to next command
+            bsp-dispatch "$@"
+            return $?
+            ;;
+        -*)
+            echo "Error: Unknown option: $command" >&2
+            echo "" >&2
+            bsp-usage
+            return 1
+            ;;
+    esac
+
+    # Map commands to libexec scripts
+    local subcommand_path="$LIBEXEC_DIR/bsp-${command}"
+
+    # Check if subcommand exists
+    if [[ -x "$subcommand_path" ]]; then
+        _log_debug "Dispatching to: $subcommand_path"
+
+        # Export environment variables for subcommands
+        export BSP_DEBUG="$DEBUG_MODE"
+        export BSP_CONFIG_FILE="$CONFIG_FILE"
+        export BSP_CONFIG_DIR="$CONFIG_DIR"
+        export BSP_CACHE_DIR="$CACHE_DIR"
+        export BSP_STATE_DIR="$STATE_DIR"
+        export BSP_LIBEXEC_DIR="$LIBEXEC_DIR"
+
+        # Execute subcommand
+        exec "$subcommand_path" "$@"
+    else
+        echo "Error: Unknown command: $command" >&2
+        echo "" >&2
+        bsp-usage
+        return 1
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+# Check if bspwm is running (except for daemon and help commands)
+if [[ "$1" != "daemon" ]] && [[ "$1" != "help" ]] && [[ "$1" != "--help" ]] && [[ "$1" != "-h" ]] && [[ "$1" != "version" ]] && [[ "$1" != "--version" ]] && [[ "$1" != "-v" ]]; then
+    if ! bspwm-is-running 2>/dev/null; then
+        _log_warn "bspwm is not running"
+        # Don't exit, some commands might still work
+    fi
+fi
+
+# Dispatch to subcommand
+bsp-dispatch "$@"
+exit_code=$?
+
+exit $exit_code

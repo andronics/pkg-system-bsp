@@ -1,0 +1,187 @@
+#!/usr/bin/env zsh
+#
+# bsp-side - Directional window placement with smart tiling
+#
+# Usage: bsp side <direction>
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+side_usage() {
+    cat <<'EOF'
+Usage: bsp side <direction>
+
+Place focused window on a specific side with smart tiling.
+
+Directions:
+  west      Place window on west side (left) with vertical split
+  north     Place window on north side (top) with horizontal split
+  east      Place window on east side (right) with vertical split
+  south     Place window on south side (bottom) with horizontal split
+
+Examples:
+  bsp side west     # Place window on left
+  bsp side north    # Place window on top
+  bsp side east     # Place window on right
+  bsp side south    # Place window on bottom
+
+Description:
+  This command places the focused window on a specific side of the layout
+  and ensures proper split orientation (vertical for west/east, horizontal
+  for north/south). It also enforces tiled state for proper layout behavior.
+
+Returns:
+  0 - Success
+  1 - Invalid direction
+  2 - No focused window or bspwm error
+EOF
+}
+
+# ============================================================================
+# SIDE PLACEMENT LOGIC
+# ============================================================================
+
+side_ensure_tiled() {
+    # Ensure the focused window is in tiled state
+    bspc query -N -n focused.window > /dev/null || return 1
+    bspc query -D -d focused.user_tiled > /dev/null || return 0
+
+    # Convert fullscreen or floating to tiled
+    if bspc node focused.fullscreen -t '~fullscreen' 2>/dev/null || \
+       bspc node focused.floating -t '~floating' 2>/dev/null; then
+        bspc node 'focused.!tiled.!pseudo_tiled.window' -t tiled 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+side_focus_first() {
+    # Swap focused node to first position (west/north)
+    bspc node '@/1.!focused' -s '@/2.focused' 2>/dev/null || {
+        # If swap fails, try receptacle approach
+        bspc node '@/1.!focused#focused' -n '@/' 2>/dev/null && \
+        bspc node '@/1.!focused' -s '@/2.focused' 2>/dev/null
+    }
+}
+
+side_focus_second() {
+    # Swap focused node to second position (east/south)
+    bspc node '@/2.!focused' -s '@/1.focused' 2>/dev/null || \
+    bspc node '@/2.!focused#focused' -n '@/' 2>/dev/null
+}
+
+side_split_horizontal() {
+    # Ensure horizontal split for north/south
+    bspc node '@/.!horizontal' -R -90 2>/dev/null && \
+    bspc node '@brother' -R 90 2>/dev/null
+}
+
+side_split_vertical() {
+    # Ensure vertical split for west/east
+    bspc node '@/.!vertical' -R -90 2>/dev/null && \
+    bspc node '@brother' -R 90 2>/dev/null
+}
+
+# ============================================================================
+# MAIN SIDE LOGIC
+# ============================================================================
+
+side_place() {
+    local direction="$1"
+
+    # Validate direction
+    if ! bsp-validate-direction "$direction"; then
+        return 2
+    fi
+
+    # Check if node is focused
+    if ! bspc query -N -n focused > /dev/null 2>&1; then
+        bsp-error "No focused window" 2
+        return 2
+    fi
+
+    # If the focused node is the root node, just ensure tiled and exit
+    if bspc query -N -n '@/.focused' > /dev/null 2>&1; then
+        side_ensure_tiled
+        return 0
+    fi
+
+    # Perform placement based on direction
+    case "$direction" in
+        west|north)
+            side_focus_first
+            ;;
+        east|south)
+            side_focus_second
+            ;;
+    esac
+
+    # Set split orientation
+    case "$direction" in
+        west|east)
+            side_split_vertical
+            ;;
+        north|south)
+            side_split_horizontal
+            ;;
+    esac
+
+    # Ensure tiled state
+    side_ensure_tiled
+
+    bsp-log-debug "Placed window in direction: $direction"
+    return 0
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+side_main() {
+    local direction="${1:-}"
+
+    if [[ -z "$direction" ]]; then
+        side_usage
+        return 2
+    fi
+
+    case "$direction" in
+        west|north|east|south)
+            side_place "$direction"
+            ;;
+        -h|--help|help)
+            side_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid direction: $direction" 2
+            echo "" >&2
+            side_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+side_main "$@"

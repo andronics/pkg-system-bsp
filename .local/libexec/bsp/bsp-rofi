@@ -1,0 +1,573 @@
+#!/usr/bin/env zsh
+#
+# bsp-rofi - Interactive Rofi menus for bsp operations
+#
+# Provides interactive Rofi-based menus for:
+# - Window selection with previews
+# - Desktop selection
+# - Layout selection
+# - Feature toggle menu
+# - Configuration editor
+#
+# Usage: bsp rofi <menu> [options]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bsp"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_BSPWM=false
+_HAS_LAYOUT=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+source "$(which _layout)" 2>/dev/null && _HAS_LAYOUT=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# ROFI CONFIGURATION
+# ============================================================================
+
+# Rofi theme
+ROFI_THEME="${BSP_ROFI_THEME:-$CONFIG_DIR/rofi/theme.rasi}"
+
+# Rofi command with default options
+rofi-cmd() {
+    local prompt="$1"
+    shift
+    local extra_args=("$@")
+
+    local rofi_args=(
+        -dmenu
+        -p "$prompt"
+        -i  # Case insensitive
+    )
+
+    # Add theme if exists
+    if [[ -f "$ROFI_THEME" ]]; then
+        rofi_args+=(-theme "$ROFI_THEME")
+    fi
+
+    # Add extra args
+    rofi_args+=("${extra_args[@]}")
+
+    rofi "${rofi_args[@]}"
+}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+rofi-help() {
+    cat <<'EOF'
+Usage: bsp rofi <menu> [options]
+
+Interactive Rofi menus for bsp operations.
+
+Menus:
+  windows                       Window selector with previews
+  desktops                      Desktop selector
+  layouts                       Layout selector
+  features                      Feature toggle menu
+  config                        Configuration editor menu
+
+Options:
+  -h, --help                    Show this help message
+  -m, --multi                   Enable multi-select (where applicable)
+
+Examples:
+  bsp rofi windows              # Select and focus window
+  bsp rofi desktops             # Select and switch desktop
+  bsp rofi layouts              # Select and apply layout
+  bsp rofi features             # Toggle features on/off
+  bsp rofi config               # Edit configuration settings
+
+Keyboard Shortcuts (in Rofi):
+  Enter                         Confirm selection
+  Escape                        Cancel
+  Ctrl+Space                    Multi-select (if enabled)
+  Tab                           Next item
+  Shift+Tab                     Previous item
+
+Returns:
+  0 - Success
+  1 - Error or cancelled
+
+EOF
+}
+
+# Check dependencies
+rofi-check-deps() {
+    if ! command -v rofi &>/dev/null; then
+        echo "Error: rofi not found" >&2
+        echo "Install: pacman -S rofi" >&2
+        return 1
+    fi
+
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# Get window title safely
+get-window-title() {
+    local window_id="$1"
+
+    if command -v xprop &>/dev/null; then
+        xprop -id "$window_id" WM_NAME 2>/dev/null | sed 's/WM_NAME(STRING) = "\(.*\)"/\1/' || echo "Untitled"
+    else
+        echo "Window $window_id"
+    fi
+}
+
+# Get window class
+get-window-class() {
+    local window_id="$1"
+
+    if command -v xprop &>/dev/null; then
+        xprop -id "$window_id" WM_CLASS 2>/dev/null | sed 's/WM_CLASS(STRING) = "\(.*\)", "\(.*\)"/\2/' || echo "Unknown"
+    else
+        echo "Unknown"
+    fi
+}
+
+# ============================================================================
+# MENU IMPLEMENTATIONS
+# ============================================================================
+
+rofi-menu-windows() {
+    local multi=false
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--multi)
+                multi=true
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                return 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    rofi-check-deps || return $?
+
+    # Get all windows
+    local windows
+    windows=$(bspwm-query-nodes ".window") || {
+        echo "Error: Failed to query windows" >&2
+        return 1
+    }
+
+    if [[ -z "$windows" ]]; then
+        echo "No windows found" >&2
+        return 1
+    fi
+
+    # Build menu items
+    local items=()
+    local window_map=()
+
+    while IFS= read -r window_id; do
+        local title class desktop
+        title=$(get-window-title "$window_id")
+        class=$(get-window-class "$window_id")
+        desktop=$(bspwm-node-get-property "$window_id" "desktop" 2>/dev/null || echo "?")
+
+        # Format: [Desktop] Class: Title
+        local item="[$desktop] $class: $title"
+        items+=("$item")
+        window_map+=("$window_id")
+    done <<< "$windows"
+
+    # Show Rofi menu
+    local rofi_args=()
+    [[ "$multi" == "true" ]] && rofi_args+=(-multi-select)
+
+    local selected_index
+    selected_index=$(printf '%s\n' "${items[@]}" | nl -w1 -s' ' | rofi-cmd "Select Window" "${rofi_args[@]}" | awk '{print $1}')
+
+    if [[ -z "$selected_index" ]]; then
+        echo "No window selected" >&2
+        return 1
+    fi
+
+    # Get window ID from index (1-based)
+    local selected_window="${window_map[$((selected_index))]}"
+
+    if [[ -z "$selected_window" ]]; then
+        echo "Error: Invalid selection" >&2
+        return 1
+    fi
+
+    # Focus the window
+    echo "Focusing window: $selected_window"
+    bspc node "$selected_window" --focus || {
+        echo "Error: Failed to focus window" >&2
+        return 1
+    }
+
+    return 0
+}
+
+rofi-menu-desktops() {
+    rofi-check-deps || return $?
+
+    # Get all desktops
+    local desktops
+    desktops=$(bspwm-query-desktops) || {
+        echo "Error: Failed to query desktops" >&2
+        return 1
+    }
+
+    if [[ -z "$desktops" ]]; then
+        echo "No desktops found" >&2
+        return 1
+    fi
+
+    # Build menu items
+    local items=()
+    local desktop_map=()
+
+    while IFS= read -r desktop_id; do
+        local name monitor layout occupied focused
+        name=$(bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "Desktop")
+        monitor=$(bspwm-desktop-get-property "$desktop_id" "monitor" 2>/dev/null || echo "?")
+        layout=$(bspwm-desktop-get-property "$desktop_id" "layout" 2>/dev/null || echo "?")
+
+        # Check if occupied
+        local nodes
+        nodes=$(bspwm-query-nodes -d "$desktop_id" 2>/dev/null)
+        if [[ -n "$nodes" ]]; then
+            occupied="●"
+        else
+            occupied="○"
+        fi
+
+        # Check if focused
+        local focused_desktop
+        focused_desktop=$(bspwm-query-desktops ".focused" 2>/dev/null)
+        if [[ "$desktop_id" == "$focused_desktop" ]]; then
+            focused="*"
+        else
+            focused=" "
+        fi
+
+        # Format: [*] ● Desktop (Monitor) [layout]
+        local item="[$focused] $occupied $name ($monitor) [$layout]"
+        items+=("$item")
+        desktop_map+=("$desktop_id")
+    done <<< "$desktops"
+
+    # Show Rofi menu
+    local selected_index
+    selected_index=$(printf '%s\n' "${items[@]}" | nl -w1 -s' ' | rofi-cmd "Select Desktop" | awk '{print $1}')
+
+    if [[ -z "$selected_index" ]]; then
+        echo "No desktop selected" >&2
+        return 1
+    fi
+
+    # Get desktop ID from index (1-based)
+    local selected_desktop="${desktop_map[$((selected_index))]}"
+
+    if [[ -z "$selected_desktop" ]]; then
+        echo "Error: Invalid selection" >&2
+        return 1
+    fi
+
+    # Focus the desktop
+    echo "Switching to desktop: $selected_desktop"
+    bspc desktop "$selected_desktop" --focus || {
+        echo "Error: Failed to focus desktop" >&2
+        return 1
+    }
+
+    return 0
+}
+
+rofi-menu-layouts() {
+    if [[ "$_HAS_LAYOUT" != "true" ]]; then
+        echo "Error: _layout library not found" >&2
+        return 1
+    fi
+
+    rofi-check-deps || return $?
+
+    # Get layouts
+    local layouts
+    layouts=$(layout-list "detailed") || {
+        echo "Error: Failed to list layouts" >&2
+        return 1
+    }
+
+    if [[ -z "$layouts" ]]; then
+        echo "No layouts found" >&2
+        echo "Create one with: bsp layout save <name>" >&2
+        return 1
+    fi
+
+    # Build menu items
+    local items=()
+    local layout_names=()
+
+    while IFS='|' read -r name description; do
+        items+=("$name - $description")
+        layout_names+=("$name")
+    done <<< "$layouts"
+
+    # Show Rofi menu
+    local selected_index
+    selected_index=$(printf '%s\n' "${items[@]}" | nl -w1 -s' ' | rofi-cmd "Select Layout" | awk '{print $1}')
+
+    if [[ -z "$selected_index" ]]; then
+        echo "No layout selected" >&2
+        return 1
+    fi
+
+    # Get layout name from index (1-based)
+    local selected_layout="${layout_names[$((selected_index))]}"
+
+    if [[ -z "$selected_layout" ]]; then
+        echo "Error: Invalid selection" >&2
+        return 1
+    fi
+
+    # Apply the layout
+    echo "Applying layout: $selected_layout"
+    layout-apply "$selected_layout" ".focused" || {
+        echo "Error: Failed to apply layout" >&2
+        return 1
+    }
+
+    return 0
+}
+
+rofi-menu-features() {
+    rofi-check-deps || return $?
+
+    # Define features
+    local features=(
+        "balance|Auto-balance window tree"
+        "desktops|Dynamic desktop management"
+        "flag|React to window flag changes"
+        "floating-borders|Remove borders from floating windows"
+        "ventilate|Terminal window swallowing"
+    )
+
+    # Build menu items with status
+    local items=()
+    local feature_names=()
+
+    for feature_def in "${features[@]}"; do
+        local feature_name="${feature_def%%|*}"
+        local feature_desc="${feature_def##*|}"
+
+        # Get feature status
+        local status="?"
+        if [[ -x "$SCRIPT_DIR/bsp-$feature_name" ]]; then
+            # Try to get status from config
+            if command -v jq &>/dev/null && [[ -f "$BSP_CONFIG_FILE" ]]; then
+                local enabled
+                enabled=$(jq -r ".features.${feature_name}.enabled // false" "$BSP_CONFIG_FILE" 2>/dev/null)
+                if [[ "$enabled" == "true" ]]; then
+                    status="✓"
+                else
+                    status="✗"
+                fi
+            fi
+        fi
+
+        items+=("[$status] $feature_name - $feature_desc")
+        feature_names+=("$feature_name")
+    done
+
+    # Show Rofi menu
+    local selected_index
+    selected_index=$(printf '%s\n' "${items[@]}" | nl -w1 -s' ' | rofi-cmd "Toggle Feature" | awk '{print $1}')
+
+    if [[ -z "$selected_index" ]]; then
+        echo "No feature selected" >&2
+        return 1
+    fi
+
+    # Get feature name from index (1-based)
+    local selected_feature="${feature_names[$((selected_index))]}"
+
+    if [[ -z "$selected_feature" ]]; then
+        echo "Error: Invalid selection" >&2
+        return 1
+    fi
+
+    # Show action menu
+    local action
+    action=$(printf '%s\n' "Enable" "Disable" "Status" | rofi-cmd "Action for $selected_feature")
+
+    case "$action" in
+        Enable)
+            echo "Enabling feature: $selected_feature"
+            "$SCRIPT_DIR/bsp-$selected_feature" on || true
+            ;;
+        Disable)
+            echo "Disabling feature: $selected_feature"
+            "$SCRIPT_DIR/bsp-$selected_feature" off || true
+            ;;
+        Status)
+            echo "Status for feature: $selected_feature"
+            "$SCRIPT_DIR/bsp-$selected_feature" status || true
+            ;;
+        *)
+            echo "Cancelled" >&2
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+rofi-menu-config() {
+    rofi-check-deps || return $?
+
+    # Define config sections
+    local sections=(
+        "View Configuration|Show current configuration"
+        "Edit Configuration|Edit config.json in $EDITOR"
+        "Reload Configuration|Reload daemon configuration"
+        "Validate Configuration|Validate config.json syntax"
+        "Show Config Path|Show configuration file location"
+    )
+
+    # Build menu items
+    local items=()
+    for section in "${sections[@]}"; do
+        local item="${section%%|*}"
+        items+=("$item")
+    done
+
+    # Show Rofi menu
+    local selected
+    selected=$(printf '%s\n' "${items[@]}" | rofi-cmd "Configuration")
+
+    if [[ -z "$selected" ]]; then
+        echo "Cancelled" >&2
+        return 1
+    fi
+
+    case "$selected" in
+        "View Configuration")
+            if command -v jq &>/dev/null; then
+                jq '.' "$BSP_CONFIG_FILE" 2>/dev/null || cat "$BSP_CONFIG_FILE"
+            else
+                cat "$BSP_CONFIG_FILE"
+            fi
+            ;;
+        "Edit Configuration")
+            "${EDITOR:-vi}" "$BSP_CONFIG_FILE"
+            ;;
+        "Reload Configuration")
+            if [[ -x "$SCRIPT_DIR/bsp-daemon" ]]; then
+                "$SCRIPT_DIR/bsp-daemon" reload
+            else
+                echo "Daemon not available" >&2
+                return 1
+            fi
+            ;;
+        "Validate Configuration")
+            if command -v jq &>/dev/null; then
+                if jq empty "$BSP_CONFIG_FILE" 2>/dev/null; then
+                    echo "Configuration is valid JSON"
+                else
+                    echo "Configuration has JSON errors" >&2
+                    return 1
+                fi
+            else
+                echo "jq not available for validation" >&2
+                return 1
+            fi
+            ;;
+        "Show Config Path")
+            echo "Configuration file: $BSP_CONFIG_FILE"
+            ;;
+        *)
+            echo "Unknown selection" >&2
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+rofi-main() {
+    local menu="${1:-}"
+
+    if [[ -z "$menu" ]] || [[ "$menu" == "-h" ]] || [[ "$menu" == "--help" ]]; then
+        rofi-help
+        return 0
+    fi
+
+    shift
+
+    case "$menu" in
+        windows|win|w)
+            rofi-menu-windows "$@"
+            ;;
+        desktops|desk|d)
+            rofi-menu-desktops "$@"
+            ;;
+        layouts|layout|l)
+            rofi-menu-layouts "$@"
+            ;;
+        features|feature|f)
+            rofi-menu-features "$@"
+            ;;
+        config|cfg|c)
+            rofi-menu-config "$@"
+            ;;
+        *)
+            echo "Error: Unknown menu: $menu" >&2
+            echo "" >&2
+            rofi-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+rofi-main "$@"

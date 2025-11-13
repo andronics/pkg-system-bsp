@@ -1,0 +1,382 @@
+#!/usr/bin/env zsh
+#
+# bsp-events - Event monitoring for bsp package
+#
+# Usage: bsp events [options]
+#
+# Monitor live bspwm events in real-time
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+
+# Load _bspwm library
+if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+    source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm"
+else
+    echo "Error: _bspwm library not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+events-help() {
+    cat <<'EOF'
+Usage: bsp events [options]
+
+Event Monitoring for BSP
+
+Monitor live bspwm events in real-time. Shows all events from bspwm
+with timestamps and formatted output.
+
+OPTIONS:
+  -h, --help           Show this help message
+  --raw                Show raw event output (no formatting)
+  --filter <type>      Filter events by type (e.g., node_add, desktop_focus)
+  --count              Count events by type (don't show each event)
+  --timestamps         Show timestamps (default: enabled)
+  --no-timestamps      Hide timestamps
+
+EVENT TYPES:
+  Node Events:
+    node_add           New window created
+    node_remove        Window closed
+    node_swap          Windows swapped
+    node_transfer      Window moved to different desktop
+    node_focus         Window focused
+    node_activate      Window activated
+    node_presel        Preselection set
+    node_stack         Window stacking order changed
+    node_geometry      Window geometry changed
+    node_state         Window state changed (tiled/floating/fullscreen)
+    node_flag          Window flag changed (sticky/private/locked/marked)
+    node_layer         Window layer changed
+
+  Desktop Events:
+    desktop_add        Desktop created
+    desktop_remove     Desktop removed
+    desktop_swap       Desktops swapped
+    desktop_transfer   Desktop moved to different monitor
+    desktop_focus      Desktop focused
+    desktop_activate   Desktop activated
+    desktop_layout     Desktop layout changed (tiled/monocle)
+
+  Monitor Events:
+    monitor_add        Monitor connected
+    monitor_remove     Monitor disconnected
+    monitor_swap       Monitors swapped
+    monitor_focus      Monitor focused
+    monitor_geometry   Monitor geometry changed
+
+EXAMPLES:
+  bsp events                           # Monitor all events
+  bsp events --filter node_add         # Only show node_add events
+  bsp events --count                   # Count events by type
+  bsp events --raw                     # Show raw bspc output
+  bsp events --no-timestamps           # Hide timestamps
+
+NOTES:
+  - Press Ctrl+C to stop monitoring
+  - Events are shown in real-time as they occur
+  - Use --filter to reduce noise
+  - Use --count for statistics
+EOF
+}
+
+# ============================================================================
+# EVENT FORMATTING
+# ============================================================================
+
+events-format-event() {
+    local event_line="$1"
+    local show_timestamps="${2:-true}"
+
+    # Parse event line
+    local parts=($=event_line)
+    local event_type="${parts[1]}"
+
+    # Format timestamp
+    local timestamp=""
+    if [[ "$show_timestamps" == "true" ]]; then
+        timestamp="[$(date '+%H:%M:%S')] "
+    fi
+
+    # Format event based on type
+    case "$event_type" in
+        node_add)
+            echo "${timestamp}+ Node added: ${parts[4]}"
+            ;;
+        node_remove)
+            echo "${timestamp}- Node removed: ${parts[4]}"
+            ;;
+        node_swap)
+            echo "${timestamp}⇄ Nodes swapped: ${parts[4]} ↔ ${parts[5]}"
+            ;;
+        node_transfer)
+            echo "${timestamp}→ Node transferred: ${parts[4]} to desktop ${parts[3]}"
+            ;;
+        node_focus)
+            echo "${timestamp}◆ Node focused: ${parts[4]}"
+            ;;
+        node_state)
+            echo "${timestamp}◇ Node state changed: ${parts[4]} → ${parts[5]}"
+            ;;
+        node_flag)
+            echo "${timestamp}⚑ Node flag changed: ${parts[4]} → ${parts[5]} = ${parts[6]}"
+            ;;
+        node_geometry)
+            echo "${timestamp}◻ Node geometry changed: ${parts[4]}"
+            ;;
+        desktop_add)
+            echo "${timestamp}+ Desktop added: ${parts[3]}"
+            ;;
+        desktop_remove)
+            echo "${timestamp}- Desktop removed: ${parts[3]}"
+            ;;
+        desktop_focus)
+            echo "${timestamp}◆ Desktop focused: ${parts[3]}"
+            ;;
+        desktop_layout)
+            echo "${timestamp}≡ Desktop layout changed: ${parts[3]} → ${parts[4]}"
+            ;;
+        monitor_add)
+            echo "${timestamp}+ Monitor added: ${parts[2]}"
+            ;;
+        monitor_remove)
+            echo "${timestamp}- Monitor removed: ${parts[2]}"
+            ;;
+        monitor_focus)
+            echo "${timestamp}◆ Monitor focused: ${parts[2]}"
+            ;;
+        *)
+            echo "${timestamp}• ${event_type}: ${parts[*]:1}"
+            ;;
+    esac
+}
+
+# ============================================================================
+# EVENT MONITORING
+# ============================================================================
+
+events-monitor() {
+    local raw="${1:-false}"
+    local filter="${2:-}"
+    local show_timestamps="${3:-true}"
+
+    bsp-ui-header "BSP Event Monitor"
+    echo "Monitoring bspwm events... (Press Ctrl+C to stop)"
+    echo ""
+
+    # Subscribe to all events
+    bspwm-subscribe \
+        node_add \
+        node_remove \
+        node_swap \
+        node_transfer \
+        node_focus \
+        node_activate \
+        node_presel \
+        node_stack \
+        node_geometry \
+        node_state \
+        node_flag \
+        node_layer \
+        desktop_add \
+        desktop_remove \
+        desktop_swap \
+        desktop_transfer \
+        desktop_focus \
+        desktop_activate \
+        desktop_layout \
+        monitor_add \
+        monitor_remove \
+        monitor_swap \
+        monitor_focus \
+        monitor_geometry | \
+    while IFS= read -r event_line; do
+        # Apply filter if specified
+        if [[ -n "$filter" ]]; then
+            local event_type
+            event_type=$(echo "$event_line" | awk '{print $1}')
+
+            if [[ "$event_type" != "$filter" ]]; then
+                continue
+            fi
+        fi
+
+        # Output event
+        if [[ "$raw" == "true" ]]; then
+            echo "$event_line"
+        else
+            events-format-event "$event_line" "$show_timestamps"
+        fi
+    done
+}
+
+events-count() {
+    local filter="${1:-}"
+
+    bsp-ui-header "BSP Event Counter"
+    echo "Counting bspwm events... (Press Ctrl+C to show results)"
+    echo ""
+
+    # Count events by type
+    typeset -A event_counts
+
+    # Subscribe to all events
+    bspwm-subscribe \
+        node_add \
+        node_remove \
+        node_swap \
+        node_transfer \
+        node_focus \
+        node_activate \
+        node_presel \
+        node_stack \
+        node_geometry \
+        node_state \
+        node_flag \
+        node_layer \
+        desktop_add \
+        desktop_remove \
+        desktop_swap \
+        desktop_transfer \
+        desktop_focus \
+        desktop_activate \
+        desktop_layout \
+        monitor_add \
+        monitor_remove \
+        monitor_swap \
+        monitor_focus \
+        monitor_geometry | \
+    {
+        # Handle Ctrl+C gracefully
+        trap 'events-show-counts; exit 0' INT
+
+        while IFS= read -r event_line; do
+            local event_type
+            event_type=$(echo "$event_line" | awk '{print $1}')
+
+            # Apply filter if specified
+            if [[ -n "$filter" ]] && [[ "$event_type" != "$filter" ]]; then
+                continue
+            fi
+
+            # Increment count
+            event_counts[$event_type]=$((${event_counts[$event_type]:-0} + 1))
+
+            # Show running total every 10 events
+            local total=0
+            for count in "${event_counts[@]}"; do
+                total=$((total + count))
+            done
+
+            if [[ $((total % 10)) -eq 0 ]]; then
+                printf "\rTotal events: %d" "$total"
+            fi
+        done
+    }
+}
+
+events-show-counts() {
+    echo ""
+    echo ""
+    bsp-ui-header "Event Statistics"
+
+    # Sort by count (descending)
+    for event_type in "${(@k)event_counts}"; do
+        echo "${event_counts[$event_type]} $event_type"
+    done | sort -rn | while read -r count event_type; do
+        printf "  %-20s %6d\n" "$event_type" "$count"
+    done
+
+    # Show total
+    local total=0
+    for count in "${event_counts[@]}"; do
+        total=$((total + count))
+    done
+
+    echo ""
+    printf "  %-20s %6d\n" "TOTAL" "$total"
+    echo ""
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+events-main() {
+    # Parse options
+    local raw=false
+    local filter=""
+    local count_mode=false
+    local show_timestamps=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                events-help
+                return 0
+                ;;
+            --raw)
+                raw=true
+                shift
+                ;;
+            --filter)
+                filter="$2"
+                shift 2
+                ;;
+            --count)
+                count_mode=true
+                shift
+                ;;
+            --timestamps)
+                show_timestamps=true
+                shift
+                ;;
+            --no-timestamps)
+                show_timestamps=false
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                events-help
+                return 2
+                ;;
+            *)
+                echo "Error: Unknown argument: $1" >&2
+                events-help
+                return 2
+                ;;
+        esac
+    done
+
+    # Check if bspwm is running
+    if ! bspwm-is-running; then
+        bsp-log-error "bspwm is not running"
+        return 1
+    fi
+
+    # Run appropriate mode
+    if [[ "$count_mode" == "true" ]]; then
+        events-count "$filter"
+    else
+        events-monitor "$raw" "$filter" "$show_timestamps"
+    fi
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+events-main "$@"

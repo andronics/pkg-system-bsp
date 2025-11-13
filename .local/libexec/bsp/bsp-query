@@ -1,0 +1,574 @@
+#!/usr/bin/env zsh
+#
+# bsp-query - Query operations command
+#
+# User-friendly wrappers for bspwm query operations:
+# - Query monitors, desktops, nodes
+# - Filter and format results
+# - JSON output support
+# - Human-readable output
+#
+# Usage: bsp query <type> [selector] [options]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_BSPWM=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+query-help() {
+    cat <<'EOF'
+Usage: bsp query <type> [selector] [options]
+
+Query bspwm state.
+
+Types:
+  monitors                      Query monitors
+  desktops                      Query desktops
+  nodes                         Query nodes (windows)
+  tree                          Query desktop tree
+
+Selectors:
+  .focused                      Focused item
+  .last                         Last focused item
+  .next                         Next item
+  .prev                         Previous item
+  .window                       Window nodes only
+  .tiled                        Tiled nodes only
+  .floating                     Floating nodes only
+  ^N                            Item on monitor/desktop N
+  <name>                        Item by name
+  <id>                          Item by ID
+
+Options:
+  -h, --help                    Show this help message
+  -j, --json                    Output as JSON
+  -f, --format FORMAT           Output format (ids, names, tree, detailed)
+  -m, --monitor SELECTOR        Filter by monitor
+  -d, --desktop SELECTOR        Filter by desktop
+  -c, --count                   Count only
+
+Examples:
+  bsp query monitors            # List all monitors
+  bsp query desktops            # List all desktops
+  bsp query nodes .focused      # Get focused node ID
+  bsp query nodes --desktop 2   # List nodes on desktop 2
+  bsp query tree .focused       # Get focused desktop tree
+  bsp query desktops --json     # Get desktops as JSON
+  bsp query nodes --count       # Count total nodes
+
+Returns:
+  0 - Success
+  1 - Error
+  2 - Invalid arguments
+
+EOF
+}
+
+# Check dependencies
+query-check-deps() {
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        return 1
+    fi
+
+    if ! command -v bspc &>/dev/null; then
+        echo "Error: bspc not found" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# QUERY IMPLEMENTATIONS
+# ============================================================================
+
+query-monitors() {
+    local selector="${1:-}"
+    local format="${2:-ids}"
+    local json=false
+    local count=false
+
+    # Parse options (remaining args)
+    shift 2 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--json)
+                json=true
+                shift
+                ;;
+            -c|--count)
+                count=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    query-check-deps || return $?
+
+    # Get monitors
+    local monitors
+    monitors=$(bspwm-query-monitors "$selector") || {
+        echo "Error: Failed to query monitors" >&2
+        return 1
+    }
+
+    if [[ -z "$monitors" ]]; then
+        [[ "$count" == "true" ]] && echo "0"
+        return 0
+    fi
+
+    # Handle count
+    if [[ "$count" == "true" ]]; then
+        echo "$monitors" | grep -c . || echo "0"
+        return 0
+    fi
+
+    # Handle JSON
+    if [[ "$json" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            local json_array="[]"
+            while IFS= read -r monitor_id; do
+                local name
+                name=$(bspwm-monitor-get-property "$monitor_id" "name" 2>/dev/null || echo "Unknown")
+                local monitor_json
+                monitor_json=$(jq -n --arg id "$monitor_id" --arg name "$name" '{id: $id, name: $name}')
+                json_array=$(echo "$json_array" | jq ". + [$monitor_json]")
+            done <<< "$monitors"
+            echo "$json_array" | jq '.'
+        else
+            echo "$monitors"
+        fi
+        return 0
+    fi
+
+    # Handle format
+    case "$format" in
+        ids)
+            echo "$monitors"
+            ;;
+        names)
+            while IFS= read -r monitor_id; do
+                bspwm-monitor-get-property "$monitor_id" "name" 2>/dev/null || echo "$monitor_id"
+            done <<< "$monitors"
+            ;;
+        detailed)
+            while IFS= read -r monitor_id; do
+                local name
+                name=$(bspwm-monitor-get-property "$monitor_id" "name" 2>/dev/null || echo "Unknown")
+                echo "$monitor_id: $name"
+            done <<< "$monitors"
+            ;;
+        *)
+            echo "$monitors"
+            ;;
+    esac
+
+    return 0
+}
+
+query-desktops() {
+    local selector="${1:-}"
+    local format="${2:-ids}"
+    local json=false
+    local count=false
+    local monitor=""
+
+    # Parse options (remaining args)
+    shift 2 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--json)
+                json=true
+                shift
+                ;;
+            -c|--count)
+                count=true
+                shift
+                ;;
+            -m|--monitor)
+                monitor="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    query-check-deps || return $?
+
+    # Build query selector
+    local query_selector="$selector"
+    if [[ -n "$monitor" ]]; then
+        query_selector="-m $monitor $selector"
+    fi
+
+    # Get desktops
+    local desktops
+    desktops=$(bspwm-query-desktops $query_selector) || {
+        echo "Error: Failed to query desktops" >&2
+        return 1
+    }
+
+    if [[ -z "$desktops" ]]; then
+        [[ "$count" == "true" ]] && echo "0"
+        return 0
+    fi
+
+    # Handle count
+    if [[ "$count" == "true" ]]; then
+        echo "$desktops" | grep -c . || echo "0"
+        return 0
+    fi
+
+    # Handle JSON
+    if [[ "$json" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            local json_array="[]"
+            while IFS= read -r desktop_id; do
+                local name monitor layout
+                name=$(bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "Unknown")
+                monitor=$(bspwm-desktop-get-property "$desktop_id" "monitor" 2>/dev/null || echo "Unknown")
+                layout=$(bspwm-desktop-get-property "$desktop_id" "layout" 2>/dev/null || echo "Unknown")
+                local desktop_json
+                desktop_json=$(jq -n \
+                    --arg id "$desktop_id" \
+                    --arg name "$name" \
+                    --arg monitor "$monitor" \
+                    --arg layout "$layout" \
+                    '{id: $id, name: $name, monitor: $monitor, layout: $layout}')
+                json_array=$(echo "$json_array" | jq ". + [$desktop_json]")
+            done <<< "$desktops"
+            echo "$json_array" | jq '.'
+        else
+            echo "$desktops"
+        fi
+        return 0
+    fi
+
+    # Handle format
+    case "$format" in
+        ids)
+            echo "$desktops"
+            ;;
+        names)
+            while IFS= read -r desktop_id; do
+                bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "$desktop_id"
+            done <<< "$desktops"
+            ;;
+        detailed)
+            while IFS= read -r desktop_id; do
+                local name monitor layout
+                name=$(bspwm-desktop-get-property "$desktop_id" "name" 2>/dev/null || echo "Unknown")
+                monitor=$(bspwm-desktop-get-property "$desktop_id" "monitor" 2>/dev/null || echo "Unknown")
+                layout=$(bspwm-desktop-get-property "$desktop_id" "layout" 2>/dev/null || echo "Unknown")
+                echo "$desktop_id: $name ($monitor) [$layout]"
+            done <<< "$desktops"
+            ;;
+        *)
+            echo "$desktops"
+            ;;
+    esac
+
+    return 0
+}
+
+query-nodes() {
+    local selector="${1:-}"
+    local format="${2:-ids}"
+    local json=false
+    local count=false
+    local monitor=""
+    local desktop=""
+
+    # Parse options (remaining args)
+    shift 2 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--json)
+                json=true
+                shift
+                ;;
+            -c|--count)
+                count=true
+                shift
+                ;;
+            -m|--monitor)
+                monitor="$2"
+                shift 2
+                ;;
+            -d|--desktop)
+                desktop="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    query-check-deps || return $?
+
+    # Build query selector
+    local query_selector="$selector"
+    if [[ -n "$monitor" ]]; then
+        query_selector="-m $monitor $query_selector"
+    fi
+    if [[ -n "$desktop" ]]; then
+        query_selector="-d $desktop $query_selector"
+    fi
+
+    # Get nodes
+    local nodes
+    nodes=$(bspwm-query-nodes $query_selector) || {
+        echo "Error: Failed to query nodes" >&2
+        return 1
+    }
+
+    if [[ -z "$nodes" ]]; then
+        [[ "$count" == "true" ]] && echo "0"
+        return 0
+    fi
+
+    # Handle count
+    if [[ "$count" == "true" ]]; then
+        echo "$nodes" | grep -c . || echo "0"
+        return 0
+    fi
+
+    # Handle JSON
+    if [[ "$json" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            local json_array="[]"
+            while IFS= read -r node_id; do
+                local state flags desktop
+                state=$(bspwm-node-get-property "$node_id" "state" 2>/dev/null || echo "Unknown")
+                flags=$(bspwm-node-get-property "$node_id" "flags" 2>/dev/null || echo "")
+                desktop=$(bspwm-node-get-property "$node_id" "desktop" 2>/dev/null || echo "Unknown")
+
+                local title class
+                if command -v xprop &>/dev/null; then
+                    title=$(xprop -id "$node_id" WM_NAME 2>/dev/null | sed 's/WM_NAME(STRING) = "\(.*\)"/\1/' || echo "Untitled")
+                    class=$(xprop -id "$node_id" WM_CLASS 2>/dev/null | sed 's/WM_CLASS(STRING) = "\(.*\)", "\(.*\)"/\2/' || echo "Unknown")
+                else
+                    title="Unknown"
+                    class="Unknown"
+                fi
+
+                local node_json
+                node_json=$(jq -n \
+                    --arg id "$node_id" \
+                    --arg title "$title" \
+                    --arg class "$class" \
+                    --arg state "$state" \
+                    --arg flags "$flags" \
+                    --arg desktop "$desktop" \
+                    '{id: $id, title: $title, class: $class, state: $state, flags: $flags, desktop: $desktop}')
+                json_array=$(echo "$json_array" | jq ". + [$node_json]")
+            done <<< "$nodes"
+            echo "$json_array" | jq '.'
+        else
+            echo "$nodes"
+        fi
+        return 0
+    fi
+
+    # Handle format
+    case "$format" in
+        ids)
+            echo "$nodes"
+            ;;
+        detailed)
+            while IFS= read -r node_id; do
+                local state desktop title class
+                state=$(bspwm-node-get-property "$node_id" "state" 2>/dev/null || echo "Unknown")
+                desktop=$(bspwm-node-get-property "$node_id" "desktop" 2>/dev/null || echo "Unknown")
+
+                if command -v xprop &>/dev/null; then
+                    title=$(xprop -id "$node_id" WM_NAME 2>/dev/null | sed 's/WM_NAME(STRING) = "\(.*\)"/\1/' || echo "Untitled")
+                    class=$(xprop -id "$node_id" WM_CLASS 2>/dev/null | sed 's/WM_CLASS(STRING) = "\(.*\)", "\(.*\)"/\2/' || echo "Unknown")
+                else
+                    title="Unknown"
+                    class="Unknown"
+                fi
+
+                echo "$node_id: $class - $title [$state] (desktop: $desktop)"
+            done <<< "$nodes"
+            ;;
+        *)
+            echo "$nodes"
+            ;;
+    esac
+
+    return 0
+}
+
+query-tree() {
+    local selector="${1:-.focused}"
+    local json=false
+
+    # Parse options (remaining args)
+    shift 1 2>/dev/null || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--json)
+                json=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    query-check-deps || return $?
+
+    # Get desktop ID
+    local desktop_id
+    desktop_id=$(bspwm-query-desktops "$selector" | head -n 1) || {
+        echo "Error: Failed to query desktop: $selector" >&2
+        return 1
+    }
+
+    if [[ -z "$desktop_id" ]]; then
+        echo "Error: Desktop not found: $selector" >&2
+        return 1
+    fi
+
+    # Get tree
+    local tree
+    tree=$(bspwm-get-tree "desktop" "$desktop_id") || {
+        echo "Error: Failed to get desktop tree" >&2
+        return 1
+    }
+
+    if [[ "$json" == "true" ]]; then
+        echo "$tree"
+    else
+        # Pretty print if possible
+        if command -v jq &>/dev/null; then
+            echo "$tree" | jq '.'
+        else
+            echo "$tree"
+        fi
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+query-main() {
+    local type="${1:-}"
+    local format="ids"
+    local json=false
+
+    if [[ -z "$type" ]] || [[ "$type" == "-h" ]] || [[ "$type" == "--help" ]]; then
+        query-help
+        return 0
+    fi
+
+    shift
+
+    # Parse global options before type-specific handling
+    local selector=""
+    local remaining_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--format)
+                format="$2"
+                shift 2
+                ;;
+            -j|--json)
+                json=true
+                remaining_args+=("$1")
+                shift
+                ;;
+            -c|--count)
+                remaining_args+=("$1")
+                shift
+                ;;
+            -m|--monitor|-d|--desktop)
+                remaining_args+=("$1" "$2")
+                shift 2
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                return 2
+                ;;
+            *)
+                if [[ -z "$selector" ]]; then
+                    selector="$1"
+                else
+                    remaining_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    case "$type" in
+        monitors|monitor|m)
+            query-monitors "$selector" "$format" "${remaining_args[@]}"
+            ;;
+        desktops|desktop|d)
+            query-desktops "$selector" "$format" "${remaining_args[@]}"
+            ;;
+        nodes|node|n|windows|window|w)
+            query-nodes "$selector" "$format" "${remaining_args[@]}"
+            ;;
+        tree|t)
+            query-tree "$selector" "${remaining_args[@]}"
+            ;;
+        *)
+            echo "Error: Unknown query type: $type" >&2
+            echo "" >&2
+            query-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+query-main "$@"

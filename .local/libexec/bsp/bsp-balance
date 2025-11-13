@@ -1,0 +1,244 @@
+#!/usr/bin/env zsh
+#
+# bsp-balance - Balance feature control
+#
+# Control the auto-balance feature (enable, disable, status, trigger)
+#
+# Usage: bsp balance <control>
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+balance-help() {
+    cat <<'EOF'
+Usage: bsp balance <control>
+
+Control the auto-balance feature.
+
+Controls:
+  on                  Enable auto-balance
+  off                 Disable auto-balance
+  status              Show current status
+  trigger             Manually trigger balance
+  config <key> [val]  Get/set configuration
+
+Options:
+  -h, --help          Show this help
+
+The balance feature automatically balances the window tree when nodes
+are added, removed, or modified, ensuring equal distribution of space.
+
+Configuration (via config subcommand):
+  strategy            Balance strategy (equal or equalize)
+  exclude_classes     Window classes to exclude from balancing
+
+Examples:
+  bsp balance on              # Enable auto-balance
+  bsp balance status          # Check if enabled
+  bsp balance trigger         # Manually balance all desktops
+  bsp balance config strategy equal
+
+Returns:
+  0 - Success
+  1 - Daemon not running (for on/off/trigger)
+  2 - Invalid arguments
+EOF
+}
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+balance-on() {
+    # Update config
+    bsp-feature-enable "balance" || return $?
+
+    # If daemon is running, reload it
+    if bsp-daemon-running; then
+        bsp-ui-info "Reloading daemon..."
+        local pid
+        pid=$(bsp-daemon-pid)
+        kill -HUP "$pid" 2>/dev/null || true
+        sleep 0.2
+    else
+        bsp-ui-warn "Daemon not running. Start it with: bsp daemon start"
+    fi
+
+    bsp-ui-success "Balance feature enabled"
+}
+
+balance-off() {
+    # Update config
+    bsp-feature-disable "balance" || return $?
+
+    # If daemon is running, reload it
+    if bsp-daemon-running; then
+        bsp-ui-info "Reloading daemon..."
+        local pid
+        pid=$(bsp-daemon-pid)
+        kill -HUP "$pid" 2>/dev/null || true
+        sleep 0.2
+    else
+        bsp-ui-warn "Daemon not running"
+    fi
+
+    bsp-ui-success "Balance feature disabled"
+}
+
+balance-status() {
+    if bsp-feature-enabled "balance"; then
+        bsp-ui-status "Balance" "ENABLED" "success"
+
+        local strategy
+        strategy=$(bsp-config-get "features.balance.strategy" "equal")
+        bsp-ui-status "Strategy" "$strategy"
+
+        if bsp-daemon-running; then
+            bsp-ui-status "Daemon" "RUNNING" "success"
+        else
+            bsp-ui-status "Daemon" "NOT RUNNING" "warn"
+        fi
+    else
+        bsp-ui-status "Balance" "DISABLED" "warn"
+    fi
+}
+
+balance-trigger() {
+    # Check daemon is running
+    if ! bsp-daemon-running; then
+        bsp-ui-error "Daemon not running. Start it with: bsp daemon start"
+        return 1
+    fi
+
+    # Load _bspwm library
+    if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+        source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm"
+    else
+        bsp-ui-error "_bspwm library not found"
+        return 1
+    fi
+
+    bsp-ui-info "Triggering manual balance..."
+
+    # Get all desktops
+    local desktops
+    desktops=$(bspwm-query-desktops 2>/dev/null)
+
+    if [[ -z "$desktops" ]]; then
+        bsp-ui-warn "No desktops found"
+        return 0
+    fi
+
+    # Balance each desktop
+    local desktop
+    local count=0
+    for desktop in ${(f)desktops}; do
+        # Get all window nodes on the desktop
+        local nodes
+        nodes=$(bspwm-query-nodes "-d $desktop -n .window" 2>/dev/null)
+
+        if [[ -n "$nodes" ]]; then
+            local node
+            for node in ${(f)nodes}; do
+                # Balance the parent tree
+                bspwm-node-balance "${node}#@parent" 2>/dev/null || true
+            done
+            count=$((count + 1))
+        fi
+    done
+
+    bsp-ui-success "Balanced $count desktops"
+}
+
+balance-config() {
+    local key="${1:-}"
+    local value="${2:-}"
+
+    if [[ -z "$key" ]]; then
+        # Show all balance config
+        echo "Balance Configuration:"
+        echo ""
+
+        local strategy
+        strategy=$(bsp-config-get "features.balance.strategy" "equal")
+        echo "  strategy: $strategy"
+
+        local exclude
+        exclude=$(bsp-config-get "features.balance.exclude_classes" "[]")
+        echo "  exclude_classes: $exclude"
+
+        return 0
+    fi
+
+    if [[ -z "$value" ]]; then
+        # Get config value
+        local result
+        result=$(bsp-config-get "features.balance.$key")
+        echo "$result"
+    else
+        # Set config value
+        bsp-config-set "features.balance.$key" "$value" || return $?
+        bsp-ui-success "Configuration updated: $key = $value"
+
+        # Reload daemon if running
+        if bsp-daemon-running; then
+            bsp-ui-info "Reloading daemon..."
+            local pid
+            pid=$(bsp-daemon-pid)
+            kill -HUP "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+balance-main() {
+    local control="${1:-}"
+    shift || true
+
+    # Handle help
+    if [[ -z "$control" ]] || [[ "$control" == "-h" ]] || [[ "$control" == "--help" ]]; then
+        balance-help
+        return 0
+    fi
+
+    # Route to control
+    case "$control" in
+        on|enable)
+            balance-on "$@"
+            ;;
+        off|disable)
+            balance-off "$@"
+            ;;
+        status)
+            balance-status "$@"
+            ;;
+        trigger)
+            balance-trigger "$@"
+            ;;
+        config)
+            balance-config "$@"
+            ;;
+        *)
+            echo "Error: Unknown control: $control" >&2
+            echo "" >&2
+            balance-help
+            return 1
+            ;;
+    esac
+}
+
+balance-main "$@"

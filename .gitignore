@@ -1,0 +1,23 @@
+# Backup files
+*.backup
+*.bak
+*~
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Package manager
+node_modules/
+__pycache__/
+*.pyc

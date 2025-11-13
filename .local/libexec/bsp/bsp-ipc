@@ -1,0 +1,493 @@
+#!/usr/bin/env zsh
+#
+# bsp-ipc - IPC utilities for bsp package
+#
+# Provides Unix socket-based IPC between CLI commands and daemon.
+# Protocol: JSON request/response over Unix socket
+#
+# Version: 2.0.0
+
+# ============================================================================
+# IPC PROTOCOL
+# ============================================================================
+
+# Request format:
+# {
+#   "command": "features.list" | "features.enable" | "features.disable" |
+#              "config.get" | "config.set" | "config.validate" |
+#              "events.subscribe" | "status.get" | "daemon.reload",
+#   "args": { ... },
+#   "id": "unique-request-id"
+# }
+
+# Response format:
+# {
+#   "success": true | false,
+#   "data": { ... },
+#   "error": "error message" | null,
+#   "id": "request-id"
+# }
+
+# ============================================================================
+# IPC CLIENT FUNCTIONS
+# ============================================================================
+
+ipc-send() {
+    local command="$1"
+    shift
+    local -A args=()
+
+    # Parse arguments into associative array
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --*=*)
+                local key="${1#--}"
+                key="${key%%=*}"
+                local value="${1#*=}"
+                args[$key]="$value"
+                shift
+                ;;
+            --*)
+                local key="${1#--}"
+                shift
+                if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+                    args[$key]="$1"
+                    shift
+                else
+                    args[$key]="true"
+                fi
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Generate request ID
+    local request_id="req-$$-$(date +%s%N)"
+
+    # Build JSON request
+    local request
+    request=$(jq -n \
+        --arg cmd "$command" \
+        --arg id "$request_id" \
+        --argjson args "$(printf '%s\n' "${(@kv)args}" | jq -Rs 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): .[1]}) | add // {}')" \
+        '{command: $cmd, args: $args, id: $id}')
+
+    bsp-log-debug "IPC request: $request"
+
+    # Send request and receive response
+    local response
+    if [[ -S "$BSP_DAEMON_SOCKET" ]]; then
+        response=$(echo "$request" | nc -U -w 5 "$BSP_DAEMON_SOCKET" 2>/dev/null)
+        local nc_status=$?
+
+        if [[ $nc_status -ne 0 ]]; then
+            bsp-log-error "Failed to communicate with daemon (nc exit code: $nc_status)"
+            return 1
+        fi
+    else
+        bsp-log-error "Daemon socket not found: $BSP_DAEMON_SOCKET"
+        return 1
+    fi
+
+    bsp-log-debug "IPC response: $response"
+
+    # Parse response
+    if [[ -z "$response" ]]; then
+        bsp-log-error "Empty response from daemon"
+        return 1
+    fi
+
+    local success
+    success=$(echo "$response" | jq -r '.success // false')
+
+    if [[ "$success" == "true" ]]; then
+        # Output data
+        echo "$response" | jq -r '.data // empty'
+        return 0
+    else
+        # Output error
+        local error
+        error=$(echo "$response" | jq -r '.error // "Unknown error"')
+        bsp-log-error "IPC error: $error"
+        return 1
+    fi
+}
+
+ipc-send-simple() {
+    local command="$1"
+    shift
+
+    # Build simple JSON request
+    local request="{\"command\": \"$command\""
+
+    if [[ $# -gt 0 ]]; then
+        local args_json
+        args_json=$(printf '%s\n' "$@" | jq -Rs 'split("\n") | map(select(length > 0))')
+        request="$request, \"args\": $args_json"
+    fi
+
+    request="$request, \"id\": \"req-$$-$(date +%s%N)\"}"
+
+    bsp-log-debug "IPC request: $request"
+
+    # Send request
+    if [[ -S "$BSP_DAEMON_SOCKET" ]]; then
+        local response
+        response=$(echo "$request" | nc -U -w 5 "$BSP_DAEMON_SOCKET" 2>/dev/null)
+
+        if [[ -z "$response" ]]; then
+            bsp-log-error "Empty response from daemon"
+            return 1
+        fi
+
+        local success
+        success=$(echo "$response" | jq -r '.success // false')
+
+        if [[ "$success" == "true" ]]; then
+            echo "$response" | jq -r '.data // empty'
+            return 0
+        else
+            local error
+            error=$(echo "$response" | jq -r '.error // "Unknown error"')
+            bsp-log-error "IPC error: $error"
+            return 1
+        fi
+    else
+        bsp-log-error "Daemon socket not found: $BSP_DAEMON_SOCKET"
+        return 1
+    fi
+}
+
+# ============================================================================
+# IPC SERVER FUNCTIONS (for daemon)
+# ============================================================================
+
+typeset -g IPC_SERVER_PID=""
+typeset -g IPC_SERVER_RUNNING=false
+
+ipc-server-start() {
+    # Ensure runtime directory exists
+    mkdir -p "$(dirname "$BSP_DAEMON_SOCKET")"
+
+    # Remove stale socket
+    [[ -S "$BSP_DAEMON_SOCKET" ]] && rm -f "$BSP_DAEMON_SOCKET"
+
+    bsp-log-info "Starting IPC server on $BSP_DAEMON_SOCKET"
+
+    # Start server in background
+    ipc-server-loop &
+    IPC_SERVER_PID=$!
+    IPC_SERVER_RUNNING=true
+
+    bsp-log-info "IPC server started (PID: $IPC_SERVER_PID)"
+}
+
+ipc-server-stop() {
+    if [[ "$IPC_SERVER_RUNNING" == "true" ]] && [[ -n "$IPC_SERVER_PID" ]]; then
+        bsp-log-info "Stopping IPC server (PID: $IPC_SERVER_PID)"
+
+        kill "$IPC_SERVER_PID" 2>/dev/null
+        wait "$IPC_SERVER_PID" 2>/dev/null
+
+        IPC_SERVER_RUNNING=false
+        IPC_SERVER_PID=""
+    fi
+
+    # Clean up socket
+    [[ -S "$BSP_DAEMON_SOCKET" ]] && rm -f "$BSP_DAEMON_SOCKET"
+
+    bsp-log-info "IPC server stopped"
+}
+
+ipc-server-loop() {
+    # Create Unix socket listener using nc
+    while [[ "$IPC_SERVER_RUNNING" == "true" ]]; do
+        # Listen for connection
+        local request
+        request=$(nc -l -U "$BSP_DAEMON_SOCKET" 2>/dev/null)
+
+        if [[ -n "$request" ]]; then
+            # Handle request in background to allow concurrent requests
+            ipc-server-handle-request "$request" &
+        fi
+
+        # Small delay to prevent CPU spinning
+        sleep 0.01
+    done
+}
+
+ipc-server-handle-request() {
+    local request="$1"
+
+    bsp-log-debug "IPC server received: $request"
+
+    # Parse request
+    local command
+    local request_id
+    command=$(echo "$request" | jq -r '.command // ""')
+    request_id=$(echo "$request" | jq -r '.id // ""')
+
+    if [[ -z "$command" ]]; then
+        ipc-server-send-error "Missing command" "$request_id"
+        return 1
+    fi
+
+    # Dispatch command
+    local data=""
+    local error=""
+    local success=true
+
+    case "$command" in
+        features.list)
+            data=$(ipc-handle-features-list "$request")
+            ;;
+        features.enable)
+            data=$(ipc-handle-features-enable "$request")
+            ;;
+        features.disable)
+            data=$(ipc-handle-features-disable "$request")
+            ;;
+        config.get)
+            data=$(ipc-handle-config-get "$request")
+            ;;
+        config.set)
+            data=$(ipc-handle-config-set "$request")
+            ;;
+        config.validate)
+            data=$(ipc-handle-config-validate "$request")
+            ;;
+        status.get)
+            data=$(ipc-handle-status-get "$request")
+            ;;
+        daemon.reload)
+            data=$(ipc-handle-daemon-reload "$request")
+            ;;
+        events.subscribe)
+            # Not implemented yet
+            error="events.subscribe not implemented"
+            success=false
+            ;;
+        *)
+            error="Unknown command: $command"
+            success=false
+            ;;
+    esac
+
+    # Send response
+    if [[ "$success" == "true" ]]; then
+        ipc-server-send-success "$data" "$request_id"
+    else
+        ipc-server-send-error "$error" "$request_id"
+    fi
+}
+
+ipc-server-send-success() {
+    local data="$1"
+    local request_id="$2"
+
+    local response
+    response=$(jq -n \
+        --arg id "$request_id" \
+        --argjson data "${data:-null}" \
+        '{success: true, data: $data, error: null, id: $id}')
+
+    echo "$response"
+}
+
+ipc-server-send-error() {
+    local error="$1"
+    local request_id="$2"
+
+    local response
+    response=$(jq -n \
+        --arg id "$request_id" \
+        --arg err "$error" \
+        '{success: false, data: null, error: $err, id: $id}')
+
+    echo "$response"
+}
+
+# ============================================================================
+# IPC COMMAND HANDLERS
+# ============================================================================
+
+ipc-handle-features-list() {
+    local request="$1"
+
+    # List all available features
+    local features=()
+    for feature in balance desktops flag floating-borders ventilate; do
+        local enabled
+        enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+        features+=($(jq -n \
+            --arg name "$feature" \
+            --arg enabled "$enabled" \
+            '{name: $name, enabled: ($enabled == "true")}'))
+    done
+
+    printf '%s\n' "${features[@]}" | jq -s '.'
+}
+
+ipc-handle-features-enable() {
+    local request="$1"
+
+    local feature
+    feature=$(echo "$request" | jq -r '.args.feature // .args[0] // ""')
+
+    if [[ -z "$feature" ]]; then
+        echo '"Missing feature argument"'
+        return 1
+    fi
+
+    # Enable feature
+    bsp-config-set "features.${feature}.enabled" "true"
+
+    # Reload daemon to apply changes
+    kill -HUP "$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null)" 2>/dev/null
+
+    jq -n --arg feature "$feature" '{feature: $feature, enabled: true}'
+}
+
+ipc-handle-features-disable() {
+    local request="$1"
+
+    local feature
+    feature=$(echo "$request" | jq -r '.args.feature // .args[0] // ""')
+
+    if [[ -z "$feature" ]]; then
+        echo '"Missing feature argument"'
+        return 1
+    fi
+
+    # Disable feature
+    bsp-config-set "features.${feature}.enabled" "false"
+
+    # Reload daemon to apply changes
+    kill -HUP "$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null)" 2>/dev/null
+
+    jq -n --arg feature "$feature" '{feature: $feature, enabled: false}'
+}
+
+ipc-handle-config-get() {
+    local request="$1"
+
+    local key
+    key=$(echo "$request" | jq -r '.args.key // .args[0] // ""')
+
+    if [[ -z "$key" ]]; then
+        # Return entire config
+        cat "$BSP_CONFIG_FILE"
+    else
+        # Return specific key
+        local value
+        value=$(bsp-config-get "$key" "")
+        jq -n --arg value "$value" '$value'
+    fi
+}
+
+ipc-handle-config-set() {
+    local request="$1"
+
+    local key
+    local value
+    key=$(echo "$request" | jq -r '.args.key // .args[0] // ""')
+    value=$(echo "$request" | jq -r '.args.value // .args[1] // ""')
+
+    if [[ -z "$key" ]] || [[ -z "$value" ]]; then
+        echo '"Missing key or value argument"'
+        return 1
+    fi
+
+    # Set config value
+    bsp-config-set "$key" "$value"
+
+    jq -n --arg key "$key" --arg value "$value" '{key: $key, value: $value}'
+}
+
+ipc-handle-config-validate() {
+    local request="$1"
+
+    if bsp-config-validate 2>/dev/null; then
+        jq -n '{valid: true, errors: []}'
+    else
+        jq -n '{valid: false, errors: ["Configuration validation failed"]}'
+    fi
+}
+
+ipc-handle-status-get() {
+    local request="$1"
+
+    # Gather daemon status
+    local daemon_pid
+    daemon_pid=$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null || echo "")
+
+    local daemon_running=false
+    if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+        daemon_running=true
+    fi
+
+    # Gather feature status
+    local features=()
+    for feature in balance desktops flag floating-borders ventilate; do
+        local enabled
+        enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+        features+=($(jq -n \
+            --arg name "$feature" \
+            --arg enabled "$enabled" \
+            '{name: $name, enabled: ($enabled == "true")}'))
+    done
+
+    # Build status object
+    jq -n \
+        --argjson daemon_running "$daemon_running" \
+        --arg daemon_pid "$daemon_pid" \
+        --argjson features "$(printf '%s\n' "${features[@]}" | jq -s '.')" \
+        '{
+            daemon: {
+                running: $daemon_running,
+                pid: $daemon_pid
+            },
+            features: $features
+        }'
+}
+
+ipc-handle-daemon-reload() {
+    local request="$1"
+
+    # Send HUP signal to daemon
+    local pid
+    pid=$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null)
+
+    if [[ -n "$pid" ]] && kill -HUP "$pid" 2>/dev/null; then
+        jq -n '{reloaded: true}'
+    else
+        echo '"Failed to reload daemon"'
+        return 1
+    fi
+}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+ipc-available() {
+    [[ -S "$BSP_DAEMON_SOCKET" ]]
+}
+
+ipc-check-dependencies() {
+    local missing=()
+
+    command -v nc &>/dev/null || missing+=("nc (netcat)")
+    command -v jq &>/dev/null || missing+=("jq")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        bsp-log-error "Missing dependencies for IPC: ${missing[*]}"
+        return 1
+    fi
+
+    return 0
+}

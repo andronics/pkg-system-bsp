@@ -1,0 +1,598 @@
+#!/usr/bin/env zsh
+#
+# bsp-node - Node (window) operations command
+#
+# User-friendly wrappers for bspwm node operations:
+# - Focus windows
+# - Move windows
+# - Resize windows
+# - Close windows
+# - Swap windows
+# - Rotate/flip tree
+# - Balance tree
+# - Set window states/flags
+#
+# Usage: bsp node <operation> [args]
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+# ============================================================================
+# LIBRARY LOADING
+# ============================================================================
+
+# Load required libraries
+if ! source "$(which _common)" 2>/dev/null; then
+    echo "Error: _common library not found" >&2
+    exit 1
+fi
+
+# Load optional libraries
+_HAS_LOG=false
+_HAS_EVENTS=false
+_HAS_BSPWM=false
+
+source "$(which _log)" 2>/dev/null && _HAS_LOG=true
+source "$(which _events)" 2>/dev/null && _HAS_EVENTS=true
+source "$(which _bspwm)" 2>/dev/null && _HAS_BSPWM=true
+
+# Load common utilities
+[[ -f "$SCRIPT_DIR/bsp-common" ]] && source "$SCRIPT_DIR/bsp-common"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+node-help() {
+    cat <<'EOF'
+Usage: bsp node <operation> [args]
+
+Node (window) operations for bspwm.
+
+Operations:
+  focus <direction>             Focus window in direction
+  move <direction>              Move window in direction
+  resize <direction> <amount>   Resize window
+  close [selector]              Close window
+  kill [selector]               Kill window (force)
+  swap <selector>               Swap with selector
+  rotate <degrees>              Rotate tree (90, 180, 270)
+  flip <axis>                   Flip tree (horizontal, vertical)
+  balance                       Balance current tree
+  state <state>                 Set window state
+  flag <flag> <on|off>          Set window flag
+  list                          List all nodes
+  info <selector>               Show node information
+
+Directions:
+  north, south, east, west      Cardinal directions
+  next, prev                    Next/previous in tree
+
+States:
+  tiled                         Tiled (default)
+  floating                      Floating
+  fullscreen                    Fullscreen
+  pseudo_tiled                  Pseudo-tiled
+
+Flags:
+  hidden                        Hidden
+  sticky                        Sticky (on all desktops)
+  private                       Private (exclude from recording)
+  locked                        Locked (cannot close)
+  marked                        Marked (for bulk operations)
+
+Selectors:
+  .focused                      Focused node
+  .last                         Last focused node
+  .newest                       Newest node
+  .oldest                       Oldest node
+  <window_id>                   Specific window ID
+
+Options:
+  -h, --help                    Show this help message
+
+Examples:
+  bsp node focus west           # Focus window to the west
+  bsp node move south           # Move window south
+  bsp node resize east 50       # Resize east by 50px
+  bsp node close .focused       # Close focused window
+  bsp node swap .last           # Swap with last window
+  bsp node rotate 90            # Rotate tree 90 degrees
+  bsp node flip horizontal      # Flip tree horizontally
+  bsp node balance              # Balance tree
+  bsp node state floating       # Set floating state
+  bsp node flag sticky on       # Set sticky flag
+  bsp node list                 # List all nodes
+
+Returns:
+  0 - Success
+  1 - Error
+  2 - Invalid arguments
+
+EOF
+}
+
+# Check dependencies
+node-check-deps() {
+    if [[ "$_HAS_BSPWM" != "true" ]]; then
+        echo "Error: _bspwm library not found" >&2
+        return 1
+    fi
+
+    if ! command -v bspc &>/dev/null; then
+        echo "Error: bspc not found" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# OPERATION IMPLEMENTATIONS
+# ============================================================================
+
+node-op-focus() {
+    local direction="${1:-}"
+
+    if [[ -z "$direction" ]]; then
+        echo "Error: Direction required" >&2
+        echo "Usage: bsp node focus <direction>" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Focusing node" "direction=$direction"
+
+    bspc node --focus "$direction" || {
+        echo "Error: Failed to focus in direction: $direction" >&2
+        return 1
+    }
+
+    echo "Focused: $direction"
+    return 0
+}
+
+node-op-move() {
+    local direction="${1:-}"
+
+    if [[ -z "$direction" ]]; then
+        echo "Error: Direction required" >&2
+        echo "Usage: bsp node move <direction>" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Moving node" "direction=$direction"
+
+    bspc node --swap "$direction" || {
+        echo "Error: Failed to move in direction: $direction" >&2
+        return 1
+    }
+
+    echo "Moved: $direction"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:moved" "direction=$direction"
+
+    return 0
+}
+
+node-op-resize() {
+    local direction="${1:-}"
+    local amount="${2:-20}"
+
+    if [[ -z "$direction" ]]; then
+        echo "Error: Direction required" >&2
+        echo "Usage: bsp node resize <direction> <amount>" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Resizing node" "direction=$direction amount=$amount"
+
+    # Translate direction to resize arguments
+    case "$direction" in
+        north|up)
+            bspc node --resize top 0 "-$amount" || bspc node --resize bottom 0 "-$amount"
+            ;;
+        south|down)
+            bspc node --resize bottom 0 "$amount" || bspc node --resize top 0 "$amount"
+            ;;
+        east|right)
+            bspc node --resize right "$amount" 0 || bspc node --resize left "$amount" 0
+            ;;
+        west|left)
+            bspc node --resize left "-$amount" 0 || bspc node --resize right "-$amount" 0
+            ;;
+        *)
+            echo "Error: Invalid direction: $direction" >&2
+            return 2
+            ;;
+    esac || {
+        echo "Error: Failed to resize" >&2
+        return 1
+    }
+
+    echo "Resized: $direction by ${amount}px"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:resized" "direction=$direction amount=$amount"
+
+    return 0
+}
+
+node-op-close() {
+    local selector="${1:-.focused}"
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Closing node" "selector=$selector"
+
+    bspc node "$selector" --close || {
+        echo "Error: Failed to close window: $selector" >&2
+        return 1
+    }
+
+    echo "Closed window: $selector"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:closed" "selector=$selector"
+
+    return 0
+}
+
+node-op-kill() {
+    local selector="${1:-.focused}"
+
+    node-check-deps || return $?
+
+    # Confirm
+    read -q "REPLY?Kill window '$selector'? (y/n) " || {
+        echo ""
+        echo "Cancelled"
+        return 0
+    }
+    echo ""
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Killing node" "selector=$selector"
+
+    bspc node "$selector" --kill || {
+        echo "Error: Failed to kill window: $selector" >&2
+        return 1
+    }
+
+    echo "Killed window: $selector"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:killed" "selector=$selector"
+
+    return 0
+}
+
+node-op-swap() {
+    local selector="${1:-}"
+
+    if [[ -z "$selector" ]]; then
+        echo "Error: Selector required" >&2
+        echo "Usage: bsp node swap <selector>" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Swapping nodes" "selector=$selector"
+
+    bspc node --swap "$selector" || {
+        echo "Error: Failed to swap with: $selector" >&2
+        return 1
+    }
+
+    echo "Swapped with: $selector"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:swapped" "selector=$selector"
+
+    return 0
+}
+
+node-op-rotate() {
+    local degrees="${1:-90}"
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Rotating tree" "degrees=$degrees"
+
+    bspc node @/ --rotate "$degrees" || {
+        echo "Error: Failed to rotate tree by $degrees degrees" >&2
+        return 1
+    }
+
+    echo "Rotated tree: ${degrees}°"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:rotated" "degrees=$degrees"
+
+    return 0
+}
+
+node-op-flip() {
+    local axis="${1:-horizontal}"
+
+    if [[ "$axis" != "horizontal" ]] && [[ "$axis" != "vertical" ]]; then
+        echo "Error: Invalid axis: $axis" >&2
+        echo "Valid axes: horizontal, vertical" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Flipping tree" "axis=$axis"
+
+    bspc node @/ --flip "$axis" || {
+        echo "Error: Failed to flip tree $axis" >&2
+        return 1
+    }
+
+    echo "Flipped tree: $axis"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:flipped" "axis=$axis"
+
+    return 0
+}
+
+node-op-balance() {
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Balancing tree"
+
+    bspc node @/ --balance || {
+        echo "Error: Failed to balance tree" >&2
+        return 1
+    }
+
+    echo "Balanced tree"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:balanced"
+
+    return 0
+}
+
+node-op-state() {
+    local state="${1:-}"
+    local selector="${2:-.focused}"
+
+    if [[ -z "$state" ]]; then
+        echo "Error: State required" >&2
+        echo "Usage: bsp node state <state> [selector]" >&2
+        echo "States: tiled, floating, fullscreen, pseudo_tiled" >&2
+        return 2
+    fi
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Setting node state" "state=$state selector=$selector"
+
+    bspc node "$selector" --state "$state" || {
+        echo "Error: Failed to set state: $state" >&2
+        return 1
+    }
+
+    echo "Set state: $state"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:state-changed" "state=$state"
+
+    return 0
+}
+
+node-op-flag() {
+    local flag="${1:-}"
+    local value="${2:-toggle}"
+    local selector="${3:-.focused}"
+
+    if [[ -z "$flag" ]]; then
+        echo "Error: Flag required" >&2
+        echo "Usage: bsp node flag <flag> <on|off|toggle> [selector]" >&2
+        echo "Flags: hidden, sticky, private, locked, marked" >&2
+        return 2
+    fi
+
+    # Normalize value
+    case "$value" in
+        on|true|yes|1)
+            value="on"
+            ;;
+        off|false|no|0)
+            value="off"
+            ;;
+        toggle|t)
+            value=""  # Empty means toggle in bspc
+            ;;
+        *)
+            echo "Error: Invalid value: $value" >&2
+            echo "Valid values: on, off, toggle" >&2
+            return 2
+            ;;
+    esac
+
+    node-check-deps || return $?
+
+    [[ "$_HAS_LOG" == "true" ]] && log-info "Setting node flag" "flag=$flag value=$value selector=$selector"
+
+    if [[ -n "$value" ]]; then
+        bspc node "$selector" --flag "$flag=$value" || {
+            echo "Error: Failed to set flag: $flag=$value" >&2
+            return 1
+        }
+    else
+        bspc node "$selector" --flag "$flag" || {
+            echo "Error: Failed to toggle flag: $flag" >&2
+            return 1
+        }
+    fi
+
+    echo "Set flag: $flag=$value"
+    [[ "$_HAS_EVENTS" == "true" ]] && events-emit "node:flag-changed" "flag=$flag value=$value"
+
+    return 0
+}
+
+node-op-list() {
+    node-check-deps || return $?
+
+    # Get all nodes
+    local nodes
+    nodes=$(bspwm-query-nodes ".window") || {
+        echo "Error: Failed to query nodes" >&2
+        return 1
+    }
+
+    if [[ -z "$nodes" ]]; then
+        echo "No windows found"
+        return 0
+    fi
+
+    echo "Windows:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local focused_node
+    focused_node=$(bspwm-query-nodes ".focused" 2>/dev/null)
+
+    while IFS= read -r node_id; do
+        local state flags desktop
+        state=$(bspwm-node-get-property "$node_id" "state" 2>/dev/null || echo "?")
+        flags=$(bspwm-node-get-property "$node_id" "flags" 2>/dev/null || echo "")
+        desktop=$(bspwm-node-get-property "$node_id" "desktop" 2>/dev/null || echo "?")
+
+        # Get window title and class
+        local title class
+        if command -v xprop &>/dev/null; then
+            title=$(xprop -id "$node_id" WM_NAME 2>/dev/null | sed 's/WM_NAME(STRING) = "\(.*\)"/\1/' || echo "Untitled")
+            class=$(xprop -id "$node_id" WM_CLASS 2>/dev/null | sed 's/WM_CLASS(STRING) = "\(.*\)", "\(.*\)"/\2/' || echo "Unknown")
+        else
+            title="Window $node_id"
+            class="Unknown"
+        fi
+
+        # Determine if focused
+        local focus_marker=""
+        if [[ "$node_id" == "$focused_node" ]]; then
+            focus_marker="*"
+        else
+            focus_marker=" "
+        fi
+
+        printf "  [%s] %-12s  Desktop: %-5s  State: %-12s  %s - %s\n" \
+            "$focus_marker" "$node_id" "$desktop" "$state" "$class" "$title"
+    done <<< "$nodes"
+
+    return 0
+}
+
+node-op-info() {
+    local selector="${1:-.focused}"
+
+    node-check-deps || return $?
+
+    # Get node ID
+    local node_id
+    node_id=$(bspwm-query-nodes "$selector" | head -n 1) || {
+        echo "Error: Failed to query node: $selector" >&2
+        return 1
+    }
+
+    if [[ -z "$node_id" ]]; then
+        echo "Error: Node not found: $selector" >&2
+        return 1
+    fi
+
+    # Get properties
+    local state flags desktop
+    state=$(bspwm-node-get-property "$node_id" "state" 2>/dev/null || echo "Unknown")
+    flags=$(bspwm-node-get-property "$node_id" "flags" 2>/dev/null || echo "None")
+    desktop=$(bspwm-node-get-property "$node_id" "desktop" 2>/dev/null || echo "Unknown")
+
+    # Get window info
+    local title class
+    if command -v xprop &>/dev/null; then
+        title=$(xprop -id "$node_id" WM_NAME 2>/dev/null | sed 's/WM_NAME(STRING) = "\(.*\)"/\1/' || echo "Untitled")
+        class=$(xprop -id "$node_id" WM_CLASS 2>/dev/null | sed 's/WM_CLASS(STRING) = "\(.*\)", "\(.*\)"/\2/' || echo "Unknown")
+    else
+        title="Unknown"
+        class="Unknown"
+    fi
+
+    echo "Node Information"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ID:          $node_id"
+    echo "Title:       $title"
+    echo "Class:       $class"
+    echo "Desktop:     $desktop"
+    echo "State:       $state"
+    echo "Flags:       $flags"
+
+    return 0
+}
+
+# ============================================================================
+# COMMAND ROUTER
+# ============================================================================
+
+node-main() {
+    local operation="${1:-}"
+
+    if [[ -z "$operation" ]] || [[ "$operation" == "-h" ]] || [[ "$operation" == "--help" ]]; then
+        node-help
+        return 0
+    fi
+
+    shift
+
+    case "$operation" in
+        focus|f)
+            node-op-focus "$@"
+            ;;
+        move|m)
+            node-op-move "$@"
+            ;;
+        resize|r)
+            node-op-resize "$@"
+            ;;
+        close|c)
+            node-op-close "$@"
+            ;;
+        kill|k)
+            node-op-kill "$@"
+            ;;
+        swap|s)
+            node-op-swap "$@"
+            ;;
+        rotate|rot)
+            node-op-rotate "$@"
+            ;;
+        flip)
+            node-op-flip "$@"
+            ;;
+        balance|b)
+            node-op-balance "$@"
+            ;;
+        state|st)
+            node-op-state "$@"
+            ;;
+        flag)
+            node-op-flag "$@"
+            ;;
+        list|ls)
+            node-op-list "$@"
+            ;;
+        info|show|i)
+            node-op-info "$@"
+            ;;
+        *)
+            echo "Error: Unknown operation: $operation" >&2
+            echo "" >&2
+            node-help
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+node-main "$@"

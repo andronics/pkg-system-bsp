@@ -1,0 +1,337 @@
+#!/usr/bin/env zsh
+#
+# bsp-features - Feature management for bsp package
+#
+# Usage: bsp features <subcommand> [options]
+#
+# Subcommands:
+#   list                  List all features and their status
+#   enable <feature>      Enable a feature
+#   disable <feature>     Disable a feature
+#   status <feature>      Show detailed status of a feature
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+source "$SCRIPT_DIR/bsp-ipc"
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+features-help() {
+    cat <<'EOF'
+Usage: bsp features <subcommand> [options]
+
+Feature Management for BSP
+
+SUBCOMMANDS:
+  list                  List all features and their status
+  enable <feature>      Enable a feature
+  disable <feature>     Disable a feature
+  status <feature>      Show detailed status of a feature
+
+FEATURES:
+  balance              Auto-balance window tree
+  desktops             Dynamic desktop management
+  flag                 React to window flag changes
+  floating-borders     Remove borders from floating windows
+  ventilate            Terminal window swallowing
+
+OPTIONS:
+  -h, --help           Show this help message
+  --json               Output in JSON format
+
+EXAMPLES:
+  bsp features list                    # List all features
+  bsp features enable balance          # Enable balance feature
+  bsp features disable ventilate       # Disable ventilate feature
+  bsp features status balance          # Show balance feature status
+
+NOTES:
+  - Changes require daemon reload (automatic via IPC)
+  - Feature status is persisted in configuration
+  - Use 'bsp daemon reload' to manually reload features
+EOF
+}
+
+# ============================================================================
+# SUBCOMMAND IMPLEMENTATIONS
+# ============================================================================
+
+features-list() {
+    local format="${1:-human}"
+
+    # Check if daemon is running for IPC
+    if bsp-daemon-running && ipc-available; then
+        # Use IPC to get live feature status
+        local response
+        response=$(ipc-send-simple "features.list" 2>/dev/null)
+
+        if [[ $? -eq 0 ]]; then
+            if [[ "$format" == "json" ]]; then
+                echo "$response"
+            else
+                features-list-human "$response"
+            fi
+            return 0
+        fi
+    fi
+
+    # Fallback: read from config file
+    features-list-from-config "$format"
+}
+
+features-list-human() {
+    local data="$1"
+
+    bsp-ui-header "BSP Features"
+
+    echo "$data" | jq -r '.[] | "\(.name)|\(.enabled)"' | while IFS='|' read -r name enabled; do
+        local status_icon
+        local status_text
+
+        if [[ "$enabled" == "true" ]]; then
+            status_icon="✓"
+            status_text="enabled"
+        else
+            status_icon="✗"
+            status_text="disabled"
+        fi
+
+        printf "  %s %-20s %s\n" "$status_icon" "$name" "$status_text"
+    done
+
+    echo ""
+}
+
+features-list-from-config() {
+    local format="${1:-human}"
+
+    local features=()
+    for feature in balance desktops flag floating-borders ventilate; do
+        local enabled
+        enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+        features+=($(jq -n \
+            --arg name "$feature" \
+            --arg enabled "$enabled" \
+            '{name: $name, enabled: ($enabled == "true")}'))
+    done
+
+    local features_json
+    features_json=$(printf '%s\n' "${features[@]}" | jq -s '.')
+
+    if [[ "$format" == "json" ]]; then
+        echo "$features_json"
+    else
+        features-list-human "$features_json"
+    fi
+}
+
+features-enable() {
+    local feature="$1"
+
+    if [[ -z "$feature" ]]; then
+        bsp-log-error "Missing feature argument"
+        echo "Usage: bsp features enable <feature>"
+        return 2
+    fi
+
+    # Validate feature
+    bsp-validate-feature "$feature" || return $?
+
+    # Check if already enabled
+    if bsp-feature-enabled "$feature"; then
+        bsp-ui-info "Feature '$feature' is already enabled"
+        return 0
+    fi
+
+    # Use IPC if daemon is running
+    if bsp-daemon-running && ipc-available; then
+        local response
+        response=$(ipc-send-simple "features.enable" "$feature" 2>/dev/null)
+
+        if [[ $? -eq 0 ]]; then
+            bsp-ui-success "Feature '$feature' enabled"
+            bsp-ui-info "Daemon reloaded to apply changes"
+            return 0
+        fi
+    fi
+
+    # Fallback: update config directly
+    bsp-config-set "features.${feature}.enabled" "true"
+    bsp-ui-success "Feature '$feature' enabled in configuration"
+    bsp-ui-info "Restart daemon to apply changes: bsp daemon restart"
+}
+
+features-disable() {
+    local feature="$1"
+
+    if [[ -z "$feature" ]]; then
+        bsp-log-error "Missing feature argument"
+        echo "Usage: bsp features disable <feature>"
+        return 2
+    fi
+
+    # Validate feature
+    bsp-validate-feature "$feature" || return $?
+
+    # Check if already disabled
+    if ! bsp-feature-enabled "$feature"; then
+        bsp-ui-info "Feature '$feature' is already disabled"
+        return 0
+    fi
+
+    # Use IPC if daemon is running
+    if bsp-daemon-running && ipc-available; then
+        local response
+        response=$(ipc-send-simple "features.disable" "$feature" 2>/dev/null)
+
+        if [[ $? -eq 0 ]]; then
+            bsp-ui-success "Feature '$feature' disabled"
+            bsp-ui-info "Daemon reloaded to apply changes"
+            return 0
+        fi
+    fi
+
+    # Fallback: update config directly
+    bsp-config-set "features.${feature}.enabled" "false"
+    bsp-ui-success "Feature '$feature' disabled in configuration"
+    bsp-ui-info "Restart daemon to apply changes: bsp daemon restart"
+}
+
+features-status() {
+    local feature="$1"
+
+    if [[ -z "$feature" ]]; then
+        # Show status of all features
+        features-list "human"
+        return 0
+    fi
+
+    # Validate feature
+    bsp-validate-feature "$feature" || return $?
+
+    # Get feature configuration
+    local enabled
+    enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+    bsp-ui-header "Feature: $feature"
+
+    # Status
+    if [[ "$enabled" == "true" ]]; then
+        bsp-ui-status "Status" "enabled" "success"
+    else
+        bsp-ui-status "Status" "disabled" "error"
+    fi
+
+    # Events
+    local events
+    events=$(bsp-config-get "features.${feature}.events" "")
+    if [[ -n "$events" ]]; then
+        local events_formatted
+        events_formatted=$(echo "$events" | jq -r '. | join(", ")' 2>/dev/null || echo "$events")
+        bsp-ui-status "Events" "$events_formatted" "info"
+    fi
+
+    # Feature-specific configuration
+    case "$feature" in
+        balance)
+            local strategy
+            strategy=$(bsp-config-get "features.balance.strategy" "equal")
+            bsp-ui-status "Strategy" "$strategy" "info"
+            ;;
+        desktops)
+            local start_id
+            local auto_naming
+            start_id=$(bsp-config-get "features.desktops.start_id" "1")
+            auto_naming=$(bsp-config-get "features.desktops.auto_naming" "false")
+            bsp-ui-status "Start ID" "$start_id" "info"
+            bsp-ui-status "Auto-naming" "$auto_naming" "info"
+            ;;
+        ventilate)
+            local terminals
+            terminals=$(bsp-config-get "features.ventilate.terminals" "")
+            if [[ -n "$terminals" ]]; then
+                local terminals_formatted
+                terminals_formatted=$(echo "$terminals" | jq -r '. | join(", ")' 2>/dev/null || echo "$terminals")
+                bsp-ui-status "Terminals" "$terminals_formatted" "info"
+            fi
+            ;;
+    esac
+
+    echo ""
+}
+
+# ============================================================================
+# MAIN DISPATCHER
+# ============================================================================
+
+features-main() {
+    local subcommand="${1:-list}"
+    shift || true
+
+    # Parse global options
+    local format="human"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                features-help
+                return 0
+                ;;
+            --json)
+                format="json"
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                features-help
+                return 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # Dispatch subcommand
+    case "$subcommand" in
+        list|ls)
+            features-list "$format"
+            ;;
+        enable|on)
+            features-enable "$@"
+            ;;
+        disable|off)
+            features-disable "$@"
+            ;;
+        status|info)
+            features-status "$@"
+            ;;
+        -h|--help|help)
+            features-help
+            ;;
+        *)
+            echo "Error: Unknown subcommand: $subcommand" >&2
+            echo ""
+            features-help
+            return 2
+            ;;
+    esac
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+features-main "$@"

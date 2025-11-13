@@ -1,0 +1,485 @@
+#!/usr/bin/env zsh
+#
+# bsp-info - System information for bsp package
+#
+# Usage: bsp info [options]
+#
+# Display system and configuration information
+#
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+
+# Load _bspwm library
+if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+    source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm"
+else
+    echo "Error: _bspwm library not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+info-help() {
+    cat <<'EOF'
+Usage: bsp info [options]
+
+System Information for BSP
+
+Display comprehensive system and configuration information including:
+  - BSP version and paths
+  - bspwm version and configuration
+  - Monitors and their geometry
+  - Desktops and their properties
+  - Dependencies and availability
+
+OPTIONS:
+  -h, --help           Show this help message
+  --json               Output in JSON format
+  --version            Show BSP version only
+  --paths              Show BSP paths only
+  --deps               Show dependencies only
+
+EXAMPLES:
+  bsp info                     # Show all information
+  bsp info --version           # Show version only
+  bsp info --json              # JSON output
+
+NOTES:
+  - Use --json for machine-readable output
+  - Useful for debugging and support
+EOF
+}
+
+# ============================================================================
+# INFO GATHERING
+# ============================================================================
+
+info-get-version() {
+    jq -n \
+        --arg bsp_version "$BSP_PACKAGE_VERSION" \
+        --arg bspwm_version "$(bspc --version 2>/dev/null || echo 'not installed')" \
+        '{
+            bsp: $bsp_version,
+            bspwm: $bspwm_version
+        }'
+}
+
+info-get-paths() {
+    jq -n \
+        --arg config_dir "$BSP_CONFIG_DIR" \
+        --arg config_file "$BSP_CONFIG_FILE" \
+        --arg cache_dir "$BSP_CACHE_DIR" \
+        --arg state_dir "$BSP_STATE_DIR" \
+        --arg runtime_dir "$BSP_RUNTIME_DIR" \
+        --arg daemon_pidfile "$BSP_DAEMON_PIDFILE" \
+        --arg daemon_socket "$BSP_DAEMON_SOCKET" \
+        --arg daemon_logfile "$BSP_DAEMON_LOGFILE" \
+        '{
+            config: {
+                directory: $config_dir,
+                file: $config_file
+            },
+            cache: {
+                directory: $cache_dir
+            },
+            state: {
+                directory: $state_dir,
+                log: $daemon_logfile
+            },
+            runtime: {
+                directory: $runtime_dir,
+                pidfile: $daemon_pidfile,
+                socket: $daemon_socket
+            }
+        }'
+}
+
+info-get-deps() {
+    local deps=()
+
+    # Check required dependencies
+    local required=(bspc xprop jq nc)
+    for dep in "${required[@]}"; do
+        local available=false
+        local version=""
+
+        if command -v "$dep" &>/dev/null; then
+            available=true
+            case "$dep" in
+                bspc)
+                    version=$(bspc --version 2>/dev/null || echo "unknown")
+                    ;;
+                jq)
+                    version=$(jq --version 2>/dev/null || echo "unknown")
+                    ;;
+                *)
+                    version="installed"
+                    ;;
+            esac
+        fi
+
+        deps+=($(jq -n \
+            --arg name "$dep" \
+            --arg required "true" \
+            --argjson available "$available" \
+            --arg version "$version" \
+            '{name: $name, required: ($required == "true"), available: $available, version: $version}'))
+    done
+
+    # Check optional dependencies
+    local optional=(rofi notify-send)
+    for dep in "${optional[@]}"; do
+        local available=false
+        local version="not installed"
+
+        if command -v "$dep" &>/dev/null; then
+            available=true
+            version="installed"
+        fi
+
+        deps+=($(jq -n \
+            --arg name "$dep" \
+            --arg required "false" \
+            --argjson available "$available" \
+            --arg version "$version" \
+            '{name: $name, required: ($required == "false"), available: $available, version: $version}'))
+    done
+
+    printf '%s\n' "${deps[@]}" | jq -s '.'
+}
+
+info-get-monitors() {
+    if ! bspwm-is-running; then
+        echo "[]"
+        return
+    fi
+
+    local monitors=()
+    local monitor_names
+    monitor_names=($(bspc query -M --names))
+
+    for monitor_name in "${monitor_names[@]}"; do
+        local geometry
+        local focused
+        local desktops
+
+        geometry=$(bspc query -T -m "$monitor_name" 2>/dev/null | jq -r '.rectangle | "\(.width)x\(.height)+\(.x)+\(.y)"')
+        focused=$(bspc query -T -m "$monitor_name" 2>/dev/null | jq -r '.focusedDesktopId // ""')
+        desktops=($(bspc query -D -m "$monitor_name" --names))
+
+        monitors+=($(jq -n \
+            --arg name "$monitor_name" \
+            --arg geometry "$geometry" \
+            --arg focused "$focused" \
+            --argjson desktops "$(printf '%s\n' "${desktops[@]}" | jq -Rs 'split("\n") | map(select(length > 0))')" \
+            '{name: $name, geometry: $geometry, focused_desktop: $focused, desktops: $desktops}'))
+    done
+
+    printf '%s\n' "${monitors[@]}" | jq -s '.'
+}
+
+info-get-desktops() {
+    if ! bspwm-is-running; then
+        echo "[]"
+        return
+    fi
+
+    local desktops=()
+    local desktop_names
+    desktop_names=($(bspc query -D --names))
+
+    for desktop_name in "${desktop_names[@]}"; do
+        local monitor
+        local layout
+        local windows_count
+
+        monitor=$(bspc query -D -d "$desktop_name" -m --names 2>/dev/null || echo "unknown")
+        layout=$(bspc query -T -d "$desktop_name" 2>/dev/null | jq -r '.layout // "tiled"')
+        windows_count=$(bspc query -N -d "$desktop_name" 2>/dev/null | wc -l)
+
+        desktops+=($(jq -n \
+            --arg name "$desktop_name" \
+            --arg monitor "$monitor" \
+            --arg layout "$layout" \
+            --arg windows_count "$windows_count" \
+            '{name: $name, monitor: $monitor, layout: $layout, windows: ($windows_count | tonumber)}'))
+    done
+
+    printf '%s\n' "${desktops[@]}" | jq -s '.'
+}
+
+info-get-all() {
+    local version
+    local paths
+    local deps
+    local monitors
+    local desktops
+
+    version=$(info-get-version)
+    paths=$(info-get-paths)
+    deps=$(info-get-deps)
+    monitors=$(info-get-monitors)
+    desktops=$(info-get-desktops)
+
+    jq -n \
+        --argjson version "$version" \
+        --argjson paths "$paths" \
+        --argjson deps "$deps" \
+        --argjson monitors "$monitors" \
+        --argjson desktops "$desktops" \
+        '{
+            version: $version,
+            paths: $paths,
+            dependencies: $deps,
+            monitors: $monitors,
+            desktops: $desktops
+        }'
+}
+
+# ============================================================================
+# INFO DISPLAY
+# ============================================================================
+
+info-display-version() {
+    local data="$1"
+
+    bsp-ui-header "Version Information"
+
+    local bsp_version
+    local bspwm_version
+
+    bsp_version=$(echo "$data" | jq -r '.bsp // "unknown"')
+    bspwm_version=$(echo "$data" | jq -r '.bspwm // "unknown"')
+
+    bsp-ui-status "BSP" "$bsp_version" "info"
+    bsp-ui-status "bspwm" "$bspwm_version" "info"
+
+    echo ""
+}
+
+info-display-paths() {
+    local data="$1"
+
+    bsp-ui-header "Paths"
+
+    echo "$data" | jq -r 'to_entries[] | .key as $section | .value | to_entries[] | "\($section)|\(.key)|\(.value)"' | \
+    while IFS='|' read -r section key value; do
+        printf "  %-15s %-20s %s\n" "$section" "$key" "$value"
+    done
+
+    echo ""
+}
+
+info-display-deps() {
+    local data="$1"
+
+    bsp-ui-header "Dependencies"
+
+    echo "$data" | jq -r '.[] | "\(.name)|\(.required)|\(.available)|\(.version)"' | \
+    while IFS='|' read -r name required available version; do
+        local status_icon
+        local status_type
+
+        if [[ "$available" == "true" ]]; then
+            status_icon="✓"
+            status_type="success"
+        else
+            status_icon="✗"
+            if [[ "$required" == "true" ]]; then
+                status_type="error"
+            else
+                status_type="warn"
+            fi
+        fi
+
+        local required_text=""
+        if [[ "$required" == "true" ]]; then
+            required_text=" (required)"
+        else
+            required_text=" (optional)"
+        fi
+
+        printf "  %s %-20s %s%s\n" "$status_icon" "$name" "$version" "$required_text"
+    done
+
+    echo ""
+}
+
+info-display-monitors() {
+    local data="$1"
+
+    bsp-ui-header "Monitors"
+
+    local count
+    count=$(echo "$data" | jq -r '. | length')
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  (none)"
+        echo ""
+        return
+    fi
+
+    echo "$data" | jq -r '.[] | "\(.name)|\(.geometry)|\(.desktops | length)"' | \
+    while IFS='|' read -r name geometry desktops_count; do
+        printf "  %-20s %s (%s desktops)\n" "$name" "$geometry" "$desktops_count"
+    done
+
+    echo ""
+}
+
+info-display-desktops() {
+    local data="$1"
+
+    bsp-ui-header "Desktops"
+
+    local count
+    count=$(echo "$data" | jq -r '. | length')
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  (none)"
+        echo ""
+        return
+    fi
+
+    echo "$data" | jq -r '.[] | "\(.name)|\(.monitor)|\(.layout)|\(.windows)"' | \
+    while IFS='|' read -r name monitor layout windows; do
+        printf "  %-15s %-15s %-10s %s windows\n" "$name" "$monitor" "$layout" "$windows"
+    done
+
+    echo ""
+}
+
+info-display-all() {
+    local data="$1"
+
+    local version
+    local paths
+    local deps
+    local monitors
+    local desktops
+
+    version=$(echo "$data" | jq -r '.version')
+    paths=$(echo "$data" | jq -r '.paths')
+    deps=$(echo "$data" | jq -r '.dependencies')
+    monitors=$(echo "$data" | jq -r '.monitors')
+    desktops=$(echo "$data" | jq -r '.desktops')
+
+    info-display-version "$version"
+    info-display-paths "$paths"
+    info-display-deps "$deps"
+    info-display-monitors "$monitors"
+    info-display-desktops "$desktops"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+info-main() {
+    # Parse options
+    local format="human"
+    local show_version=false
+    local show_paths=false
+    local show_deps=false
+    local show_all=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                info-help
+                return 0
+                ;;
+            --json)
+                format="json"
+                shift
+                ;;
+            --version)
+                show_version=true
+                show_all=false
+                shift
+                ;;
+            --paths)
+                show_paths=true
+                show_all=false
+                shift
+                ;;
+            --deps)
+                show_deps=true
+                show_all=false
+                shift
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                info-help
+                return 2
+                ;;
+            *)
+                echo "Error: Unknown argument: $1" >&2
+                info-help
+                return 2
+                ;;
+        esac
+    done
+
+    # Display information
+    if [[ "$show_all" == "true" ]]; then
+        local data
+        data=$(info-get-all)
+
+        if [[ "$format" == "json" ]]; then
+            echo "$data" | jq -C '.'
+        else
+            info-display-all "$data"
+        fi
+    else
+        if [[ "$show_version" == "true" ]]; then
+            local data
+            data=$(info-get-version)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                info-display-version "$data"
+            fi
+        fi
+
+        if [[ "$show_paths" == "true" ]]; then
+            local data
+            data=$(info-get-paths)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                info-display-paths "$data"
+            fi
+        fi
+
+        if [[ "$show_deps" == "true" ]]; then
+            local data
+            data=$(info-get-deps)
+
+            if [[ "$format" == "json" ]]; then
+                echo "$data" | jq -C '.'
+            else
+                info-display-deps "$data"
+            fi
+        fi
+    fi
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+info-main "$@"

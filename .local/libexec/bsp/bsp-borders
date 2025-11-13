@@ -1,0 +1,220 @@
+#!/usr/bin/env zsh
+#
+# bsp-borders - Control floating borders feature
+#
+# Usage: bsp borders <control> [args]
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+borders_usage() {
+    cat <<'EOF'
+Usage: bsp borders <control> [args]
+
+Control the floating borders feature.
+
+Controls:
+  on                       Enable borders feature
+  off                      Disable borders feature
+  status                   Show feature status
+  config <key> [value]     Get or set configuration
+
+Configuration Keys:
+  floating_width           Border width for floating windows (pixels)
+  tiled_width              Border width for tiled windows (pixels)
+
+Examples:
+  bsp borders on                         # Enable feature
+  bsp borders status                     # Show current status
+  bsp borders config floating_width 0    # No borders for floating windows
+  bsp borders config tiled_width 1       # 1px borders for tiled windows
+
+Description:
+  The borders feature automatically adjusts window borders based on their
+  state (floating, tiled, or fullscreen). This is useful for visually
+  distinguishing floating windows from tiled ones.
+
+  Typical configuration:
+    - Floating windows: 0px border (borderless)
+    - Tiled windows: 1px border (standard)
+    - Fullscreen windows: 0px border (always borderless)
+
+Returns:
+  0 - Success
+  1 - Daemon not running or error
+  2 - Invalid arguments
+EOF
+}
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+
+borders_enable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.floating_borders.enabled" "true" || return 1
+    bsp-ui-success "Borders feature enabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+borders_disable() {
+    # Phase 2: Direct config update (Phase 3 will use IPC)
+    bsp-config-set "features.floating_borders.enabled" "false" || return 1
+    bsp-ui-success "Borders feature disabled"
+    bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+    return 0
+}
+
+borders_status() {
+    # Phase 2: Read config directly (Phase 3 will use IPC)
+    local enabled=$(bsp-config-get "features.floating_borders.enabled" "false")
+    local floating_width=$(bsp-config-get "features.floating_borders.border_width" "0")
+    local tiled_width=$(bsp-config-get "features.floating_borders.tiled_border_width" "1")
+
+    # Get current window counts
+    local total_windows=$(bspc query -N -n .window 2>/dev/null | wc -l)
+    local floating_windows=$(bspc query -N -n .floating 2>/dev/null | wc -l)
+    local tiled_windows=$(bspc query -N -n .tiled 2>/dev/null | wc -l)
+
+    bsp-ui-header "Borders Feature Status"
+    bsp-ui-status "Status" "$([ "$enabled" == "true" ] && echo "ENABLED" || echo "DISABLED")" "$([ "$enabled" == "true" ] && echo "success" || echo "warn")"
+    bsp-ui-status "Events" "node_state"
+    echo ""
+    echo "Configuration:"
+    bsp-ui-status "  Floating width" "${floating_width}px"
+    bsp-ui-status "  Tiled width" "${tiled_width}px"
+    echo ""
+    echo "Current Windows:"
+    bsp-ui-status "  Total" "$total_windows"
+    bsp-ui-status "  Floating" "$floating_windows"
+    bsp-ui-status "  Tiled" "$tiled_windows"
+
+    return 0
+}
+
+borders_config() {
+    local key="$1"
+    local value="$2"
+
+    if [[ -z "$key" ]]; then
+        # Show all config
+        echo "Borders Configuration:"
+        echo "  floating_width: $(bsp-config-get 'features.floating_borders.border_width' '0')"
+        echo "  tiled_width: $(bsp-config-get 'features.floating_borders.tiled_border_width' '1')"
+        return 0
+    fi
+
+    # Validate key
+    case "$key" in
+        floating_width|tiled_width)
+            ;;
+        *)
+            bsp-error "Invalid config key: $key" 2
+            echo "Valid keys: floating_width, tiled_width" >&2
+            return 2
+            ;;
+    esac
+
+    if [[ -z "$value" ]]; then
+        # Get config value
+        local config_key
+        case "$key" in
+            floating_width)
+                config_key="features.floating_borders.border_width"
+                ;;
+            tiled_width)
+                config_key="features.floating_borders.tiled_border_width"
+                ;;
+        esac
+
+        local current=$(bsp-config-get "$config_key")
+        echo "$current"
+        return 0
+    else
+        # Validate value (must be non-negative integer)
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+            bsp-error "Invalid value: $value (must be a non-negative integer)" 2
+            return 2
+        fi
+
+        # Set config value
+        local config_key
+        case "$key" in
+            floating_width)
+                config_key="features.floating_borders.border_width"
+                ;;
+            tiled_width)
+                config_key="features.floating_borders.tiled_border_width"
+                ;;
+        esac
+
+        bsp-config-set "$config_key" "$value" || return 1
+        bsp-ui-success "Configuration updated: $key = $value"
+        bsp-ui-info "Note: Restart daemon to apply changes (bsp daemon restart)"
+        return 0
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+borders_main() {
+    local control="${1:-}"
+
+    if [[ -z "$control" ]]; then
+        borders_usage
+        return 2
+    fi
+
+    case "$control" in
+        on)
+            borders_enable
+            ;;
+        off)
+            borders_disable
+            ;;
+        status)
+            borders_status
+            ;;
+        config)
+            shift
+            borders_config "$@"
+            ;;
+        -h|--help|help)
+            borders_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid control: $control" 2
+            echo "" >&2
+            borders_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+borders_main "$@"

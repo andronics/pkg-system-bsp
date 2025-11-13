@@ -1,0 +1,299 @@
+#!/usr/bin/env zsh
+#
+# bspd - Unified daemon for bsp package
+#
+# Single daemon with event loop that manages all event-driven features:
+# - balance: Auto-balance window tree
+# - desktops: Dynamic desktop management
+# - flag: React to window flag changes
+# - floating-borders: Remove borders from floating windows
+# - ventilate: Terminal window swallowing
+#
+# Architecture: Event bus with feature handlers
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Source common utilities
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/bsp-common"
+
+# Load IPC utilities
+source "$SCRIPT_DIR/bsp-ipc"
+
+# Load _bspwm library
+if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+    source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm"
+else
+    echo "Error: _bspwm library not found" >&2
+    exit 1
+fi
+
+# Daemon state
+typeset -g DAEMON_RUNNING=true
+typeset -g DAEMON_RELOAD_REQUESTED=false
+
+# Feature modules directory
+FEATURES_DIR="$SCRIPT_DIR/features"
+
+# Loaded feature modules
+typeset -A LOADED_FEATURES
+
+# ============================================================================
+# SIGNAL HANDLERS
+# ============================================================================
+
+daemon-handle-term() {
+    bsp-log-info "Received TERM signal, shutting down..."
+    DAEMON_RUNNING=false
+}
+
+daemon-handle-hup() {
+    bsp-log-info "Received HUP signal, reloading configuration..."
+    DAEMON_RELOAD_REQUESTED=true
+}
+
+# Setup signal traps
+trap daemon-handle-term TERM INT
+trap daemon-handle-hup HUP
+
+# ============================================================================
+# PID FILE MANAGEMENT
+# ============================================================================
+
+daemon-create-pidfile() {
+    local pid=$$
+
+    # Ensure runtime directory exists
+    mkdir -p "$(dirname "$BSP_DAEMON_PIDFILE")"
+
+    # Write PID file
+    echo "$pid" > "$BSP_DAEMON_PIDFILE"
+
+    bsp-log-debug "Created PID file: $BSP_DAEMON_PIDFILE (PID: $pid)"
+}
+
+daemon-remove-pidfile() {
+    if [[ -f "$BSP_DAEMON_PIDFILE" ]]; then
+        rm -f "$BSP_DAEMON_PIDFILE"
+        bsp-log-debug "Removed PID file"
+    fi
+}
+
+# ============================================================================
+# FEATURE MANAGEMENT
+# ============================================================================
+
+daemon-load-feature() {
+    local feature="$1"
+
+    # Check if feature is enabled in config
+    if ! bsp-feature-enabled "$feature"; then
+        bsp-log-debug "Feature $feature is disabled, skipping"
+        return 0
+    fi
+
+    # Check if feature module exists
+    local feature_file="$FEATURES_DIR/${feature}.zsh"
+
+    if [[ -f "$feature_file" ]]; then
+        bsp-log-info "Loading feature: $feature"
+
+        # Source feature module
+        source "$feature_file"
+
+        # Call feature init function if it exists
+        local init_fn="${feature//-/_}_init"
+        if (( $+functions[$init_fn] )); then
+            $init_fn
+            LOADED_FEATURES[$feature]="loaded"
+            bsp-log-info "Feature $feature initialized"
+        else
+            bsp-log-warn "Feature $feature has no init function: $init_fn"
+        fi
+    else
+        bsp-log-warn "Feature module not found: $feature_file"
+    fi
+}
+
+daemon-unload-feature() {
+    local feature="$1"
+
+    if [[ -n "${LOADED_FEATURES[$feature]}" ]]; then
+        bsp-log-info "Unloading feature: $feature"
+
+        # Call feature cleanup function if it exists
+        local cleanup_fn="${feature//-/_}_cleanup"
+        if (( $+functions[$cleanup_fn] )); then
+            $cleanup_fn
+        fi
+
+        unset "LOADED_FEATURES[$feature]"
+    fi
+}
+
+daemon-reload-features() {
+    bsp-log-info "Reloading features..."
+
+    # Unload all features
+    for feature in "${(@k)LOADED_FEATURES}"; do
+        daemon-unload-feature "$feature"
+    done
+
+    # Reload configuration
+    bsp-common-init
+
+    # Load enabled features
+    for feature in balance desktops flag floating-borders ventilate; do
+        daemon-load-feature "$feature"
+    done
+
+    DAEMON_RELOAD_REQUESTED=false
+    bsp-log-info "Features reloaded"
+}
+
+# ============================================================================
+# EVENT LOOP
+# ============================================================================
+
+daemon-parse-event() {
+    local event_line="$1"
+
+    # Parse event line from bspc subscribe
+    # Format: event_type monitor_id desktop_id node_id ...
+
+    local parts=($=event_line)
+    local event_type="${parts[1]}"
+
+    echo "$event_type"
+}
+
+daemon-dispatch-event() {
+    local event_line="$1"
+    local event_type
+    event_type=$(daemon-parse-event "$event_line")
+
+    bsp-log-debug "Event: $event_type"
+
+    # Dispatch to feature handlers
+    for feature in "${(@k)LOADED_FEATURES}"; do
+        local handler_fn="${feature//-/_}_handle_event"
+
+        if (( $+functions[$handler_fn] )); then
+            # Call handler with event line
+            $handler_fn "$event_type" "$event_line" 2>&1 | while IFS= read -r line; do
+                bsp-log-debug "[$feature] $line"
+            done
+        fi
+    done
+}
+
+daemon-event-loop() {
+    bsp-log-info "Starting event loop"
+
+    # Subscribe to all events
+    bspwm-subscribe \
+        node_add \
+        node_remove \
+        node_swap \
+        node_transfer \
+        node_focus \
+        node_activate \
+        node_presel \
+        node_stack \
+        node_geometry \
+        node_state \
+        node_flag \
+        node_layer \
+        desktop_add \
+        desktop_remove \
+        desktop_swap \
+        desktop_transfer \
+        desktop_focus \
+        desktop_activate \
+        desktop_layout \
+        monitor_add \
+        monitor_remove \
+        monitor_swap \
+        monitor_focus \
+        monitor_geometry | \
+    while IFS= read -r event_line && [[ "$DAEMON_RUNNING" == "true" ]]; do
+        # Handle reload request
+        if [[ "$DAEMON_RELOAD_REQUESTED" == "true" ]]; then
+            daemon-reload-features
+        fi
+
+        # Dispatch event
+        daemon-dispatch-event "$event_line"
+    done
+
+    bsp-log-info "Event loop terminated"
+}
+
+# ============================================================================
+# DAEMON LIFECYCLE
+# ============================================================================
+
+daemon-startup() {
+    bsp-log-info "BSP daemon starting (PID: $$)"
+
+    # Check if bspwm is running
+    if ! bspwm-is-running; then
+        echo "Error: bspwm is not running" >&2
+        exit 1
+    fi
+
+    # Create PID file
+    daemon-create-pidfile
+
+    # Start IPC server
+    ipc-server-start
+
+    # Load enabled features
+    for feature in balance desktops flag floating-borders ventilate; do
+        daemon-load-feature "$feature"
+    done
+
+    bsp-log-info "Daemon initialized with ${#LOADED_FEATURES[@]} features"
+}
+
+daemon-shutdown() {
+    bsp-log-info "BSP daemon shutting down"
+
+    # Stop IPC server
+    ipc-server-stop
+
+    # Unload all features
+    for feature in "${(@k)LOADED_FEATURES}"; do
+        daemon-unload-feature "$feature"
+    done
+
+    # Remove PID file
+    daemon-remove-pidfile
+
+    bsp-log-info "Daemon stopped"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+daemon-main() {
+    # Startup
+    daemon-startup
+
+    # Run event loop
+    daemon-event-loop
+
+    # Shutdown
+    daemon-shutdown
+
+    exit 0
+}
+
+# Run daemon
+daemon-main "$@"

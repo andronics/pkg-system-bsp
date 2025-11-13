@@ -1,0 +1,183 @@
+#!/usr/bin/env zsh
+#
+# bsp-shroud - Hide/show windows and polybar simultaneously
+#
+# Usage: bsp shroud <action>
+#
+# Part of the bsp package (Phase 2)
+# Version: 2.0.0
+
+set -eo pipefail
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Determine directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Load common utilities
+if [[ -f "$SCRIPT_DIR/bsp-common" ]]; then
+    source "$SCRIPT_DIR/bsp-common"
+else
+    echo "Error: bsp-common not found" >&2
+    exit 1
+fi
+
+# ============================================================================
+# USAGE
+# ============================================================================
+
+shroud_usage() {
+    cat <<'EOF'
+Usage: bsp shroud <action>
+
+Hide or show windows and polybar simultaneously.
+
+Actions:
+  cover     Hide polybar and all leaf windows on focused desktop
+  reveal    Show polybar and all leaf windows on focused desktop
+
+Examples:
+  bsp shroud cover      # Hide everything for clean desktop
+  bsp shroud reveal     # Restore visibility
+
+Description:
+  The shroud command provides a quick way to hide or show all windows
+  on the focused desktop along with the polybar status bar. This is
+  useful for screenshots, presentations, or temporarily decluttering
+  the desktop.
+
+  Cover Action:
+    - Hides polybar (using polybar-msg cmd hide)
+    - Sets hidden flag on all leaf windows on focused desktop
+
+  Reveal Action:
+    - Shows polybar (using polybar-msg cmd show)
+    - Removes hidden flag from all leaf windows on focused desktop
+
+Returns:
+  0 - Success
+  1 - Invalid action
+  2 - Polybar not running (warning only)
+EOF
+}
+
+# ============================================================================
+# SHROUD LOGIC
+# ============================================================================
+
+shroud_cover() {
+    bsp-log-debug "Covering desktop"
+
+    # Hide polybar if running
+    if pgrep -x polybar > /dev/null 2>&1; then
+        bsp-log-debug "Hiding polybar"
+        polybar-msg cmd hide 2>/dev/null || bsp-warn "Failed to hide polybar"
+    else
+        bsp-log-debug "Polybar not running"
+    fi
+
+    # Get all leaf nodes on focused desktop
+    local nodes
+    if (( $+functions[bspwm-query-nodes] )); then
+        nodes=$(bspwm-query-nodes "-n .leaf -d focused" 2>/dev/null)
+    else
+        nodes=$(bspc query -N -n .leaf -d focused 2>/dev/null)
+    fi
+
+    if [[ -z "$nodes" ]]; then
+        bsp-log-debug "No nodes to hide"
+        return 0
+    fi
+
+    # Hide each node
+    local node
+    local hidden_count=0
+    for node in ${(f)nodes}; do
+        if bspc node "$node" -g hidden=on 2>/dev/null; then
+            hidden_count=$((hidden_count + 1))
+            bsp-log-debug "Hid node: $node"
+        else
+            bsp-log-warn "Failed to hide node: $node"
+        fi
+    done
+
+    bsp-log-info "Covered desktop: hidden $hidden_count window(s)"
+    return 0
+}
+
+shroud_reveal() {
+    bsp-log-debug "Revealing desktop"
+
+    # Show polybar if running
+    if pgrep -x polybar > /dev/null 2>&1; then
+        bsp-log-debug "Showing polybar"
+        polybar-msg cmd show 2>/dev/null || bsp-warn "Failed to show polybar"
+    else
+        bsp-log-debug "Polybar not running"
+    fi
+
+    # Get all leaf nodes on focused desktop
+    local nodes
+    if (( $+functions[bspwm-query-nodes] )); then
+        nodes=$(bspwm-query-nodes "-n .leaf -d focused" 2>/dev/null)
+    else
+        nodes=$(bspc query -N -n .leaf -d focused 2>/dev/null)
+    fi
+
+    if [[ -z "$nodes" ]]; then
+        bsp-log-debug "No nodes to reveal"
+        return 0
+    fi
+
+    # Show each node
+    local node
+    local revealed_count=0
+    for node in ${(f)nodes}; do
+        if bspc node "$node" -g hidden=off 2>/dev/null; then
+            revealed_count=$((revealed_count + 1))
+            bsp-log-debug "Revealed node: $node"
+        else
+            bsp-log-warn "Failed to reveal node: $node"
+        fi
+    done
+
+    bsp-log-info "Revealed desktop: shown $revealed_count window(s)"
+    return 0
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+shroud_main() {
+    local action="${1:-}"
+
+    if [[ -z "$action" ]]; then
+        shroud_usage
+        return 2
+    fi
+
+    case "$action" in
+        cover)
+            shroud_cover
+            ;;
+        reveal)
+            shroud_reveal
+            ;;
+        -h|--help|help)
+            shroud_usage
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid action: $action" 2
+            echo "" >&2
+            shroud_usage
+            return 2
+            ;;
+    esac
+}
+
+# Execute main function
+shroud_main "$@"

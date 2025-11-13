@@ -1,0 +1,880 @@
+#!/usr/bin/env zsh
+#
+# bsp-common - Common utilities for bsp package
+#
+# This file is sourced by all bsp scripts and subcommands.
+# It provides shared functions, variables, and configurations.
+#
+# Version: 2.0.0
+
+# ============================================================================
+# SHARED VARIABLES
+# ============================================================================
+
+# Package metadata
+typeset -g BSP_PACKAGE_NAME="bsp"
+typeset -g BSP_PACKAGE_VERSION="2.0.0"
+typeset -g BSP_PACKAGE_AUTHOR="BSP Package Team"
+
+# Directory paths (prefer environment, fallback to defaults)
+typeset -g BSP_CONFIG_DIR="${BSP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bsp}"
+typeset -g BSP_CACHE_DIR="${BSP_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/bsp}"
+typeset -g BSP_STATE_DIR="${BSP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bsp}"
+typeset -g BSP_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/bsp-$UID"
+
+# Configuration files
+typeset -g BSP_CONFIG_FILE="${BSP_CONFIG_FILE:-$BSP_CONFIG_DIR/config.json}"
+typeset -g BSP_CONFIG_SCHEMA="$BSP_CONFIG_DIR/config.schema.json"
+
+# Runtime files
+typeset -g BSP_DAEMON_PIDFILE="$BSP_RUNTIME_DIR/bspd.pid"
+typeset -g BSP_DAEMON_SOCKET="$BSP_RUNTIME_DIR/bsp.sock"
+typeset -g BSP_DAEMON_LOGFILE="$BSP_STATE_DIR/bsp.log"
+
+# Feature flags (based on library availability)
+typeset -g BSP_FEATURES=()
+
+# Debug mode
+typeset -g BSP_DEBUG="${BSP_DEBUG:-false}"
+
+# ============================================================================
+# INITIALIZATION FUNCTIONS
+# ============================================================================
+
+bsp-common-init() {
+    # Ensure directories exist
+    mkdir -p "$BSP_CONFIG_DIR" "$BSP_CACHE_DIR" "$BSP_STATE_DIR" "$BSP_RUNTIME_DIR"
+
+    # Initialize default configuration if needed
+    if [[ ! -f "$BSP_CONFIG_FILE" ]]; then
+        bsp-common-create-default-config
+    fi
+
+    # Initialize feature flags
+    bsp-common-init-features
+
+    # Load _bspwm library if available
+    if [[ -f "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" ]]; then
+        source "/home/andronics/.dotfiles/lib/.local/bin/_bspwm" 2>/dev/null || true
+    fi
+}
+
+bsp-common-create-default-config() {
+    cat > "$BSP_CONFIG_FILE" <<'EOF'
+{
+  "$schema": "./config.schema.json",
+  "version": "2.0",
+
+  "features": {
+    "balance": {
+      "enabled": true,
+      "strategy": "equal",
+      "exclude_classes": [],
+      "events": ["node_add", "node_remove", "node_state", "node_geometry"]
+    },
+
+    "desktops": {
+      "enabled": true,
+      "start_id": 1,
+      "auto_naming": false,
+      "naming_pattern": "Desktop {id}",
+      "events": ["node_add", "node_remove", "node_state", "node_geometry"]
+    },
+
+    "flag": {
+      "enabled": true,
+      "events": ["node_flag"],
+      "marked": {
+        "border_width": 3,
+        "border_color": "#0000ff"
+      },
+      "floating": {
+        "border_width": 2,
+        "border_color": "#00ff00"
+      },
+      "hidden": {
+        "border_width": 0
+      },
+      "sticky": {
+        "border_color": "#ffff00"
+      },
+      "locked": {
+        "border_color": "#ff0000"
+      },
+      "private": {
+        "border_color": "#ff00ff"
+      }
+    },
+
+    "floating_borders": {
+      "enabled": true,
+      "border_width": 0,
+      "events": ["node_state"]
+    },
+
+    "ventilate": {
+      "enabled": true,
+      "terminals": [
+        "Alacritty",
+        "terminal-drop",
+        "Code"
+      ],
+      "no_inhale": [
+        "Rofi",
+        "xev",
+        "xprop",
+        "gcr-prompter",
+        "firefox",
+        "Google-chrome"
+      ],
+      "events": ["node_add", "node_remove"],
+      "state_file": "${XDG_STATE_HOME}/bsp/inhaled.json"
+    }
+  },
+
+  "ipc": {
+    "socket": "${XDG_RUNTIME_DIR}/bsp.sock",
+    "timeout": 5,
+    "buffer_size": 4096
+  },
+
+  "logging": {
+    "level": "INFO",
+    "file": "${XDG_STATE_HOME}/bsp/bsp.log",
+    "max_size": "10M",
+    "rotate": 5,
+    "format": "[{timestamp}] [{level}] [{context}] {message}"
+  },
+
+  "cache": {
+    "enabled": true,
+    "ttl": {
+      "nodes": 5,
+      "desktops": 5,
+      "monitors": 5,
+      "tree": 5,
+      "window_properties": 60,
+      "config": 3600
+    },
+    "file": "${XDG_CACHE_HOME}/bsp/cache.json"
+  },
+
+  "layouts": {
+    "directory": "${XDG_CONFIG_HOME}/bsp/layouts",
+    "auto_apply": false,
+    "default_layout": "default"
+  },
+
+  "notifications": {
+    "enabled": true,
+    "events": {
+      "desktop_added": true,
+      "desktop_removed": true,
+      "layout_applied": true,
+      "feature_enabled": false,
+      "feature_disabled": false,
+      "errors": true
+    },
+    "urgency": {
+      "info": "normal",
+      "warning": "normal",
+      "error": "critical"
+    }
+  },
+
+  "ui": {
+    "colors": true,
+    "unicode": true,
+    "tree": {
+      "symbols": {
+        "vertical": "│",
+        "horizontal": "─",
+        "corner": "└",
+        "tee": "├"
+      }
+    }
+  }
+}
+EOF
+
+    bsp-log-info "Created default configuration at $BSP_CONFIG_FILE"
+}
+
+bsp-common-init-features() {
+    # Detect available features based on libraries
+    if (( $+functions[bspwm-query-nodes] )); then
+        BSP_FEATURES+=("bspwm")
+    fi
+
+    if command -v jq &>/dev/null; then
+        BSP_FEATURES+=("json")
+    fi
+
+    if command -v rofi &>/dev/null; then
+        BSP_FEATURES+=("rofi")
+    fi
+
+    bsp-log-debug "Available features: ${BSP_FEATURES[*]}"
+}
+
+# ============================================================================
+# CONFIGURATION HELPERS
+# ============================================================================
+
+bsp-config-get() {
+    local key="$1"
+    local default="${2:-}"
+
+    if [[ ! -f "$BSP_CONFIG_FILE" ]]; then
+        echo "$default"
+        return 1
+    fi
+
+    # Use jq if available for proper JSON parsing
+    if command -v jq &>/dev/null; then
+        local value
+        value=$(jq -r ".$key // \"$default\"" "$BSP_CONFIG_FILE" 2>/dev/null)
+        if [[ "$value" == "null" ]] || [[ -z "$value" ]]; then
+            echo "$default"
+        else
+            echo "$value"
+        fi
+    else
+        # Fallback: basic grep parsing (not recommended for complex queries)
+        echo "$default"
+    fi
+}
+
+bsp-config-set() {
+    local key="$1"
+    local value="$2"
+
+    if [[ ! -f "$BSP_CONFIG_FILE" ]]; then
+        bsp-log-error "Configuration file not found: $BSP_CONFIG_FILE"
+        return 1
+    fi
+
+    # Use jq if available for proper JSON modification
+    if command -v jq &>/dev/null; then
+        local tmp
+        tmp=$(mktemp)
+
+        if jq ".$key = \"$value\"" "$BSP_CONFIG_FILE" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$BSP_CONFIG_FILE"
+            bsp-log-info "Configuration updated: $key = $value"
+            return 0
+        else
+            rm -f "$tmp"
+            bsp-log-error "Failed to update configuration"
+            return 1
+        fi
+    else
+        bsp-log-error "jq is required for configuration updates"
+        return 1
+    fi
+}
+
+bsp-config-validate() {
+    if [[ ! -f "$BSP_CONFIG_FILE" ]]; then
+        bsp-log-error "Configuration file not found: $BSP_CONFIG_FILE"
+        return 1
+    fi
+
+    # Basic JSON syntax validation
+    if command -v jq &>/dev/null; then
+        if jq empty "$BSP_CONFIG_FILE" 2>/dev/null; then
+            bsp-log-info "Configuration syntax is valid"
+            return 0
+        else
+            bsp-log-error "Configuration has syntax errors"
+            return 1
+        fi
+    else
+        bsp-log-warn "jq not available, skipping validation"
+        return 0
+    fi
+}
+
+# ============================================================================
+# LOGGING HELPERS
+# ============================================================================
+
+bsp-log-to-file() {
+    local level="$1"
+    local message="$2"
+    local context="${3:-main}"
+
+    # Only log to file if daemon is running
+    if [[ -n "$BSP_DAEMON_LOGFILE" ]]; then
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+        # Ensure log directory exists
+        mkdir -p "$(dirname "$BSP_DAEMON_LOGFILE")"
+
+        # Write to log file
+        echo "[$timestamp] [$level] [$context] $message" >> "$BSP_DAEMON_LOGFILE"
+
+        # Rotate log if too large (10MB)
+        if [[ -f "$BSP_DAEMON_LOGFILE" ]]; then
+            local size
+            size=$(stat -c %s "$BSP_DAEMON_LOGFILE" 2>/dev/null || stat -f %z "$BSP_DAEMON_LOGFILE" 2>/dev/null || echo "0")
+
+            if [[ $size -gt 10485760 ]]; then
+                # Rotate logs (keep 5 versions)
+                for i in {4..1}; do
+                    local old_log="${BSP_DAEMON_LOGFILE}.$i"
+                    local new_log="${BSP_DAEMON_LOGFILE}.$((i + 1))"
+                    [[ -f "$old_log" ]] && mv "$old_log" "$new_log"
+                done
+
+                mv "$BSP_DAEMON_LOGFILE" "${BSP_DAEMON_LOGFILE}.1"
+                touch "$BSP_DAEMON_LOGFILE"
+            fi
+        fi
+    fi
+}
+
+# ============================================================================
+# UI/UX COLORS AND ICONS
+# ============================================================================
+
+# Color codes
+typeset -g C_RESET="\033[0m"
+typeset -g C_BLACK="\033[30m"
+typeset -g C_RED="\033[31m"
+typeset -g C_GREEN="\033[32m"
+typeset -g C_YELLOW="\033[33m"
+typeset -g C_BLUE="\033[34m"
+typeset -g C_MAGENTA="\033[35m"
+typeset -g C_CYAN="\033[36m"
+typeset -g C_WHITE="\033[37m"
+typeset -g C_BOLD="\033[1m"
+typeset -g C_DIM="\033[2m"
+
+# Semantic colors
+typeset -g C_INFO="$C_BLUE"
+typeset -g C_SUCCESS="$C_GREEN"
+typeset -g C_WARNING="$C_YELLOW"
+typeset -g C_ERROR="$C_RED"
+typeset -g C_DEBUG="$C_DIM"
+
+# Icons
+typeset -g ICON_SUCCESS="✓"
+typeset -g ICON_ERROR="✗"
+typeset -g ICON_WARNING="⚠"
+typeset -g ICON_INFO="ℹ"
+typeset -g ICON_DEBUG="○"
+typeset -g ICON_ARROW="→"
+typeset -g ICON_BULLET="•"
+typeset -g ICON_CHECK="☑"
+typeset -g ICON_UNCHECK="☐"
+typeset -g ICON_LIGHTNING="⚡"
+typeset -g ICON_LOCK="🔒"
+typeset -g ICON_UNLOCK="🔓"
+typeset -g ICON_STAR="★"
+typeset -g ICON_HEART="♥"
+typeset -g ICON_PLAY="▶"
+typeset -g ICON_PAUSE="⏸"
+typeset -g ICON_STOP="⏹"
+
+# Disable colors if not in terminal or NO_COLOR set
+if [[ ! -t 1 ]] || [[ -n "${NO_COLOR:-}" ]]; then
+    C_RESET="" C_BLACK="" C_RED="" C_GREEN="" C_YELLOW=""
+    C_BLUE="" C_MAGENTA="" C_CYAN="" C_WHITE="" C_BOLD="" C_DIM=""
+    C_INFO="" C_SUCCESS="" C_WARNING="" C_ERROR="" C_DEBUG=""
+fi
+
+bsp-log-debug() {
+    local message="$1"
+    local context="${2:-main}"
+
+    if [[ "$BSP_DEBUG" == "true" ]]; then
+        echo -e "${C_DEBUG}${ICON_DEBUG} [bsp] $message${C_RESET}" >&2
+        bsp-log-to-file "DEBUG" "$message" "$context"
+    fi
+}
+
+bsp-log-info() {
+    local message="$1"
+    local context="${2:-main}"
+
+    echo -e "${C_INFO}${ICON_INFO} [bsp] $message${C_RESET}" >&2
+    bsp-log-to-file "INFO" "$message" "$context"
+}
+
+bsp-log-warn() {
+    local message="$1"
+    local context="${2:-main}"
+
+    echo -e "${C_WARNING}${ICON_WARNING} [bsp] $message${C_RESET}" >&2
+    bsp-log-to-file "WARN" "$message" "$context"
+}
+
+bsp-log-error() {
+    local message="$1"
+    local context="${2:-main}"
+
+    echo -e "${C_ERROR}${ICON_ERROR} [bsp] $message${C_RESET}" >&2
+    bsp-log-to-file "ERROR" "$message" "$context"
+}
+
+bsp-log-success() {
+    local message="$1"
+    local context="${2:-main}"
+
+    echo -e "${C_SUCCESS}${ICON_SUCCESS} [bsp] $message${C_RESET}" >&2
+    bsp-log-to-file "SUCCESS" "$message" "$context"
+}
+
+# ============================================================================
+# PROGRESS INDICATORS
+# ============================================================================
+
+bsp-progress-bar() {
+    # Display a progress bar
+    # Usage: bsp-progress-bar <current> <total> [width]
+
+    local current="$1"
+    local total="$2"
+    local width="${3:-50}"
+
+    local percent=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    echo -ne "\r${C_CYAN}Progress: ${C_RESET}[$bar] ${C_BOLD}${percent}%${C_RESET} (${current}/${total})"
+}
+
+bsp-progress-spinner() {
+    # Display a simple spinner
+    # Usage: bsp-progress-spinner <message> &
+    #        SPINNER_PID=$!
+    #        ... do work ...
+    #        kill $SPINNER_PID
+
+    local message="$1"
+    local spinner=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+
+    while true; do
+        echo -ne "\r${C_CYAN}${spinner[$i]} ${message}${C_RESET}"
+        i=$(((i + 1) % ${#spinner[@]}))
+        sleep 0.1
+    done
+}
+
+bsp-progress-done() {
+    # Clear progress line and show completion
+    local message="${1:-Done}"
+    echo -e "\r${C_SUCCESS}${ICON_SUCCESS} ${message}${C_RESET}                              "
+}
+
+# ============================================================================
+# ERROR HANDLING HELPERS
+# ============================================================================
+
+bsp-error() {
+    local message="$1"
+    local exit_code="${2:-1}"
+
+    bsp-log-error "$message"
+    return "$exit_code"
+}
+
+bsp-warn() {
+    local message="$1"
+    bsp-log-warn "$message"
+}
+
+# ============================================================================
+# VALIDATION HELPERS
+# ============================================================================
+
+bsp-validate-feature() {
+    local feature="$1"
+
+    case "$feature" in
+        balance|desktops|flag|floating-borders|ventilate)
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid feature: $feature" 2
+            return 2
+            ;;
+    esac
+}
+
+bsp-validate-direction() {
+    local direction="$1"
+
+    case "$direction" in
+        west|north|east|south)
+            return 0
+            ;;
+        *)
+            bsp-error "Invalid direction: $direction (must be west, north, east, or south)" 2
+            return 2
+            ;;
+    esac
+}
+
+# ============================================================================
+# DAEMON HELPERS
+# ============================================================================
+
+bsp-daemon-running() {
+    if [[ -f "$BSP_DAEMON_PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$BSP_DAEMON_PIDFILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+bsp-daemon-pid() {
+    if bsp-daemon-running; then
+        cat "$BSP_DAEMON_PIDFILE"
+    else
+        return 1
+    fi
+}
+
+bsp-daemon-ensure-running() {
+    if ! bsp-daemon-running; then
+        bsp-error "Daemon not running. Start it with: bsp daemon start" 1
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================================
+# IPC HELPERS (Stubs for Phase 1)
+# ============================================================================
+
+bsp-ipc-send() {
+    local command="$1"
+    shift
+    local args=("$@")
+
+    # Stub: IPC will be implemented in Phase 3
+    bsp-log-debug "IPC: $command ${args[*]}"
+
+    # For now, return error indicating IPC not implemented
+    bsp-warn "IPC not yet implemented - Phase 3 feature"
+    return 1
+}
+
+# ============================================================================
+# UI HELPERS
+# ============================================================================
+
+bsp-ui-success() {
+    local message="$1"
+    echo "✓ $message"
+}
+
+bsp-ui-error() {
+    local message="$1"
+    echo "✗ $message" >&2
+}
+
+bsp-ui-info() {
+    local message="$1"
+    echo "→ $message"
+}
+
+bsp-ui-header() {
+    local text="$1"
+    local width="${2:-80}"
+
+    echo ""
+    echo "$text"
+    printf '━%.0s' $(seq 1 $width)
+    echo ""
+}
+
+bsp-ui-status() {
+    local label="$1"
+    local value="$2"
+    local status="${3:-info}"
+
+    local symbol
+    case "$status" in
+        success) symbol="✓" ;;
+        error) symbol="✗" ;;
+        warn) symbol="!" ;;
+        *) symbol="→" ;;
+    esac
+
+    printf "  %s %-20s %s\n" "$symbol" "$label" "$value"
+}
+
+# ============================================================================
+# UTILITY HELPERS
+# ============================================================================
+
+bsp-expand-vars() {
+    local input="$1"
+
+    # Expand environment variables
+    input="${input//\$\{XDG_CONFIG_HOME\}/${XDG_CONFIG_HOME:-$HOME/.config}}"
+    input="${input//\$\{XDG_CACHE_HOME\}/${XDG_CACHE_HOME:-$HOME/.cache}}"
+    input="${input//\$\{XDG_STATE_HOME\}/${XDG_STATE_HOME:-$HOME/.local/state}}"
+    input="${input//\$\{XDG_RUNTIME_DIR\}/${XDG_RUNTIME_DIR:-/tmp}}"
+    input="${input//\$\{HOME\}/$HOME}"
+
+    echo "$input"
+}
+
+bsp-file-age() {
+    local file="$1"
+
+    if [[ ! -f "$file" ]]; then
+        echo "never"
+        return 1
+    fi
+
+    local now
+    local mtime
+    local age
+
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)
+    age=$((now - mtime))
+
+    if [[ $age -lt 60 ]]; then
+        echo "${age}s ago"
+    elif [[ $age -lt 3600 ]]; then
+        echo "$((age / 60))m ago"
+    elif [[ $age -lt 86400 ]]; then
+        echo "$((age / 3600))h ago"
+    else
+        echo "$((age / 86400))d ago"
+    fi
+}
+
+bsp-format-uptime() {
+    local seconds="$1"
+
+    if [[ $seconds -lt 60 ]]; then
+        echo "${seconds}s"
+    elif [[ $seconds -lt 3600 ]]; then
+        echo "$((seconds / 60))m"
+    elif [[ $seconds -lt 86400 ]]; then
+        local hours=$((seconds / 3600))
+        local mins=$(((seconds % 3600) / 60))
+        echo "${hours}h ${mins}m"
+    else
+        local days=$((seconds / 86400))
+        local hours=$(((seconds % 86400) / 3600))
+        echo "${days}d ${hours}h"
+    fi
+}
+
+# ============================================================================
+# FEATURE CONTROL HELPERS
+# ============================================================================
+
+bsp-feature-enabled() {
+    local feature="$1"
+
+    bsp-validate-feature "$feature" || return $?
+
+    local enabled
+    enabled=$(bsp-config-get "features.${feature}.enabled" "false")
+
+    [[ "$enabled" == "true" ]]
+}
+
+bsp-feature-enable() {
+    local feature="$1"
+
+    bsp-validate-feature "$feature" || return $?
+
+    bsp-config-set "features.${feature}.enabled" "true"
+}
+
+bsp-feature-disable() {
+    local feature="$1"
+
+    bsp-validate-feature "$feature" || return $?
+
+    bsp-config-set "features.${feature}.enabled" "false"
+}
+
+# ============================================================================
+# PERFORMANCE OPTIMIZATION HELPERS
+# ============================================================================
+
+# Cache for bspc query results (associative array)
+typeset -gA BSP_QUERY_CACHE
+typeset -gA BSP_QUERY_CACHE_TIME
+
+bsp-cache-key() {
+    # Generate cache key from command and arguments
+    echo "$*" | md5sum | cut -d' ' -f1
+}
+
+bsp-cache-get() {
+    local cache_key="$1"
+    local ttl="${2:-5}"  # Default 5 second TTL
+
+    local now=$(date +%s)
+    local cache_time="${BSP_QUERY_CACHE_TIME[$cache_key]:-0}"
+    local age=$((now - cache_time))
+
+    if [[ -n "${BSP_QUERY_CACHE[$cache_key]}" ]] && [[ $age -lt $ttl ]]; then
+        echo "${BSP_QUERY_CACHE[$cache_key]}"
+        return 0
+    fi
+
+    return 1
+}
+
+bsp-cache-set() {
+    local cache_key="$1"
+    local value="$2"
+
+    BSP_QUERY_CACHE[$cache_key]="$value"
+    BSP_QUERY_CACHE_TIME[$cache_key]=$(date +%s)
+}
+
+bsp-cache-clear() {
+    BSP_QUERY_CACHE=()
+    BSP_QUERY_CACHE_TIME=()
+    bsp-log-debug "Query cache cleared"
+}
+
+bsp-query-cached() {
+    # Cached wrapper for bspc query commands
+    # Usage: bsp-query-cached [ttl] -- bspc query args...
+
+    local ttl=5
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        ttl="$1"
+        shift
+    fi
+
+    # Skip the -- separator if present
+    [[ "$1" == "--" ]] && shift
+
+    local cache_key=$(bsp-cache-key "$@")
+
+    # Try cache first
+    if result=$(bsp-cache-get "$cache_key" "$ttl"); then
+        bsp-log-debug "Cache hit for: $*"
+        echo "$result"
+        return 0
+    fi
+
+    # Execute query and cache result
+    bsp-log-debug "Cache miss for: $*"
+    local result
+    if result=$("$@" 2>/dev/null); then
+        bsp-cache-set "$cache_key" "$result"
+        echo "$result"
+        return 0
+    else
+        return $?
+    fi
+}
+
+# Debounce events to reduce processing load
+typeset -gA BSP_DEBOUNCE_TIMERS
+
+bsp-debounce() {
+    # Debounce a command execution
+    # Usage: bsp-debounce <key> <delay> <command> [args...]
+
+    local key="$1"
+    local delay="$2"
+    shift 2
+    local command=("$@")
+
+    # Cancel previous timer if exists
+    if [[ -n "${BSP_DEBOUNCE_TIMERS[$key]}" ]]; then
+        kill "${BSP_DEBOUNCE_TIMERS[$key]}" 2>/dev/null || true
+        unset "BSP_DEBOUNCE_TIMERS[$key]"
+    fi
+
+    # Start new timer in background
+    (
+        sleep "$delay"
+        "${command[@]}"
+    ) &
+
+    BSP_DEBOUNCE_TIMERS[$key]=$!
+}
+
+# Batch bspc operations to reduce overhead
+typeset -g BSP_BATCH_COMMANDS=()
+typeset -g BSP_BATCH_ACTIVE=false
+
+bsp-batch-start() {
+    BSP_BATCH_COMMANDS=()
+    BSP_BATCH_ACTIVE=true
+    bsp-log-debug "Batch mode started"
+}
+
+bsp-batch-add() {
+    if [[ "$BSP_BATCH_ACTIVE" == "true" ]]; then
+        BSP_BATCH_COMMANDS+=("$*")
+    else
+        # Execute immediately if not in batch mode
+        "$@"
+    fi
+}
+
+bsp-batch-execute() {
+    if [[ "$BSP_BATCH_ACTIVE" != "true" ]]; then
+        bsp-log-warn "No active batch to execute"
+        return 1
+    fi
+
+    local count=${#BSP_BATCH_COMMANDS[@]}
+    bsp-log-debug "Executing batch of $count commands"
+
+    for cmd in "${BSP_BATCH_COMMANDS[@]}"; do
+        eval "$cmd"
+    done
+
+    BSP_BATCH_COMMANDS=()
+    BSP_BATCH_ACTIVE=false
+}
+
+# Measure command execution time
+bsp-measure() {
+    local start=$(date +%s%N)
+    "$@"
+    local status=$?
+    local end=$(date +%s%N)
+    local elapsed=$(((end - start) / 1000000))  # Convert to milliseconds
+
+    bsp-log-debug "Command took ${elapsed}ms: $*"
+    return $status
+}
+
+# Optimized bspc wrapper that uses caching
+bsp-bspc() {
+    # Check if this is a query command that can be cached
+    if [[ "$1" == "query" ]]; then
+        bsp-query-cached 5 -- bspc "$@"
+    else
+        # Non-query commands bypass cache
+        bspc "$@"
+    fi
+}
+
+# ============================================================================
+# AUTO-INITIALIZATION
+# ============================================================================
+
+# Initialize common utilities when sourced
+bsp-common-init
