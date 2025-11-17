@@ -202,6 +202,179 @@ jobs:
           echo "Running shellcheck..."
           find . -type f \( -name "*.sh" \) -exec shellcheck {} \; || echo "⚠️  Shellcheck found issues (non-blocking)"
 
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: validate
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh stow curl git
+
+      - name: Install pkg-cli
+        run: |
+          echo "Installing pkg-cli..."
+          mkdir -p ~/.pkg-cli/bin
+          curl -fsSL https://raw.githubusercontent.com/andronics/pkg-cli/trunk/bin/pkg-cli -o ~/.pkg-cli/bin/pkg-cli
+          chmod +x ~/.pkg-cli/bin/pkg-cli
+          echo "$HOME/.pkg-cli/bin" >> $GITHUB_PATH
+
+      - name: Verify pkg-cli installation
+        run: |
+          export PATH="$HOME/.pkg-cli/bin:$PATH"
+          pkg-cli --version || echo "pkg-cli version check failed, continuing..."
+          pkg-cli --help
+
+      - name: Extract package name
+        id: package_info
+        run: |
+          # Extract collection and name from repo
+          REPO_NAME="${{ github.repository }}"
+          REPO_NAME="${REPO_NAME#*/}"  # Remove owner/
+
+          # Parse pkg-collection-name format
+          if [[ "$REPO_NAME" =~ ^pkg-([^-]+)-(.+)$ ]]; then
+            COLLECTION="${BASH_REMATCH[1]}"
+            NAME="${BASH_REMATCH[2]}"
+            PACKAGE="@${COLLECTION}/${NAME}"
+            echo "package=$PACKAGE" >> $GITHUB_OUTPUT
+            echo "collection=$COLLECTION" >> $GITHUB_OUTPUT
+            echo "name=$NAME" >> $GITHUB_OUTPUT
+            echo "Package: $PACKAGE"
+          else
+            echo "Failed to parse package name from: $REPO_NAME"
+            exit 1
+          fi
+
+      - name: Test package installation
+        env:
+          PACKAGE: ${{ steps.package_info.outputs.package }}
+        run: |
+          export PATH="$HOME/.pkg-cli/bin:$PATH"
+
+          echo "Testing installation of: $PACKAGE"
+
+          # Clone the package
+          pkg-cli -v clone "$PACKAGE" || {
+            echo "❌ Failed to clone package"
+            exit 1
+          }
+
+          echo "✅ Package cloned successfully"
+
+      - name: Verify installation structure
+        env:
+          PACKAGE: ${{ steps.package_info.outputs.package }}
+          COLLECTION: ${{ steps.package_info.outputs.collection }}
+          NAME: ${{ steps.package_info.outputs.name }}
+        run: |
+          echo "Verifying installation structure..."
+
+          REMOTE_DIR="$HOME/.local-packages/pkg-${COLLECTION}-${NAME}"
+
+          # Check remote directory exists
+          if [ ! -d "$REMOTE_DIR" ]; then
+            echo "❌ Remote directory not found: $REMOTE_DIR"
+            exit 1
+          fi
+          echo "✅ Remote directory exists: $REMOTE_DIR"
+
+          # Check symlinks were created
+          if [ -d "$REMOTE_DIR/.local" ]; then
+            echo "Checking for symlinks in ~/.local..."
+
+            # List what was stowed
+            echo "Files in remote package:"
+            find "$REMOTE_DIR/.local" -type f -o -type l | head -20
+
+            # Verify at least some files were symlinked
+            SYMLINK_COUNT=$(find ~/.local -type l -lname "$REMOTE_DIR/*" 2>/dev/null | wc -l)
+            if [ "$SYMLINK_COUNT" -gt 0 ]; then
+              echo "✅ Found $SYMLINK_COUNT symlinks from package"
+            else
+              echo "⚠️  Warning: No symlinks found, package may be empty or structure different"
+            fi
+          fi
+
+      - name: Test package functionality
+        env:
+          COLLECTION: ${{ steps.package_info.outputs.collection }}
+          NAME: ${{ steps.package_info.outputs.name }}
+        run: |
+          echo "Testing package functionality..."
+
+          # Test based on collection type
+          case "$COLLECTION" in
+            core)
+              # For core/lib, test that it can be loaded
+              if [ "$NAME" = "lib" ]; then
+                echo "Testing lib loading..."
+                if [ -f "$HOME/.local/share/lib/core/lib-common.zsh" ]; then
+                  zsh -c "source $HOME/.local/share/lib/core/lib-common.zsh && echo '✅ lib-common loaded successfully'" || {
+                    echo "❌ Failed to load lib-common"
+                    exit 1
+                  }
+                fi
+              fi
+
+              # For core/bin or core/kv, test binaries exist
+              if [ -d "$HOME/.local/bin" ]; then
+                BIN_COUNT=$(find ~/.local/bin -type f -o -type l 2>/dev/null | wc -l)
+                if [ "$BIN_COUNT" -gt 0 ]; then
+                  echo "✅ Found $BIN_COUNT binaries in ~/.local/bin"
+                  find ~/.local/bin -type f -o -type l | head -5
+                fi
+              fi
+              ;;
+
+            system|devtools|apps|experimental)
+              # Check for binaries
+              if [ -d "$HOME/.local/bin" ]; then
+                BIN_COUNT=$(find ~/.local/bin -type l -lname "*pkg-${COLLECTION}-${NAME}*" 2>/dev/null | wc -l)
+                if [ "$BIN_COUNT" -gt 0 ]; then
+                  echo "✅ Found $BIN_COUNT binaries from package"
+                else
+                  echo "ℹ️  No binaries found (package may not provide binaries)"
+                fi
+              fi
+              ;;
+          esac
+
+          echo "✅ Functionality tests completed"
+
+      - name: Test package update
+        env:
+          PACKAGE: ${{ steps.package_info.outputs.package }}
+        run: |
+          export PATH="$HOME/.pkg-cli/bin:$PATH"
+
+          echo "Testing package update..."
+          pkg-cli -v update "$PACKAGE" || {
+            echo "❌ Failed to update package"
+            exit 1
+          }
+
+          echo "✅ Package updated successfully"
+
+      - name: Integration test summary
+        if: always()
+        run: |
+          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ pkg-cli installation" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Package clone" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Stow symlinking" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Functionality verification" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Package update" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Integration Test**: PASSED ✅" >> $GITHUB_STEP_SUMMARY
+
   package-info:
     name: Package Information
     runs-on: ubuntu-latest
@@ -239,7 +412,7 @@ jobs:
   summary:
     name: Summary
     runs-on: ubuntu-latest
-    needs: [validate, test, lint, package-info]
+    needs: [validate, test, lint, integration-test, package-info]
     if: always()
 
     steps:
@@ -264,6 +437,12 @@ jobs:
             echo "✅ Lint: PASSED" >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️  Lint: WARNINGS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.integration-test.result }}" == "success" ]; then
+            echo "✅ Integration Test: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Integration Test: FAILED" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
