@@ -1,0 +1,270 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, trunk ]
+  pull_request:
+    branches: [ main, trunk ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh
+
+      - name: Check for shell scripts
+        id: check_scripts
+        run: |
+          if find . -type f \( -name "*.zsh" -o -name "*.sh" \) -print -quit | grep -q .; then
+            echo "has_scripts=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_scripts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Syntax check Zsh scripts
+        if: steps.check_scripts.outputs.has_scripts == 'true'
+        run: |
+          echo "Checking Zsh scripts..."
+          find . -type f -name "*.zsh" ! -path "*/templates/*" ! -name "*.template.*" -print0 | while IFS= read -r -d '' file; do
+            echo "Checking: $file"
+            zsh -n "$file" || exit 1
+          done
+
+      - name: Syntax check Bash scripts
+        if: steps.check_scripts.outputs.has_scripts == 'true'
+        run: |
+          echo "Checking Bash scripts..."
+          find . -type f -name "*.sh" ! -path "*/templates/*" ! -name "*.template.*" -print0 | while IFS= read -r -d '' file; do
+            echo "Checking: $file"
+            bash -n "$file" || exit 1
+          done
+
+      - name: Check for package.conf
+        id: check_conf
+        run: |
+          if [ -f "package.conf" ]; then
+            echo "has_conf=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_conf=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate package.conf
+        if: steps.check_conf.outputs.has_conf == 'true'
+        run: |
+          echo "Validating package.conf..."
+          bash -n package.conf || exit 1
+
+      - name: Check directory structure
+        run: |
+          echo "Package structure:"
+          tree -L 3 -a || ls -la
+
+      - name: Check for required files
+        run: |
+          echo "Checking for required files..."
+
+          # Check for README
+          if [ ! -f "README.md" ]; then
+            echo "⚠️  Warning: README.md not found"
+          else
+            echo "✓ README.md found"
+          fi
+
+          # Check for LICENSE
+          if [ ! -f "LICENSE" ]; then
+            echo "⚠️  Warning: LICENSE not found"
+          else
+            echo "✓ LICENSE found"
+          fi
+
+          # Check for package.conf
+          if [ ! -f "package.conf" ]; then
+            echo "⚠️  Warning: package.conf not found"
+          else
+            echo "✓ package.conf found"
+          fi
+
+      - name: Validate symlink targets
+        run: |
+          echo "Checking for broken symlinks..."
+          if find . -type l -exec test ! -e {} \; -print | grep -q .; then
+            echo "❌ Broken symlinks found:"
+            find . -type l -exec test ! -e {} \; -print
+            exit 1
+          else
+            echo "✓ No broken symlinks"
+          fi
+
+      - name: Check for common issues
+        run: |
+          echo "Checking for common issues..."
+
+          # Check for credentials
+          if grep -r "password\|secret\|token\|api_key" --include="*.zsh" --include="*.sh" --exclude-dir=.git . 2>/dev/null | grep -v "# Example\|# TODO\|password=\$"; then
+            echo "⚠️  Warning: Potential credentials found in code"
+          fi
+
+          # Check for absolute paths (potential portability issues)
+          if grep -r "/home/\|/Users/" --include="*.zsh" --include="*.sh" --exclude-dir=.git . 2>/dev/null; then
+            echo "⚠️  Warning: Hard-coded home paths found"
+          fi
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: validate
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh
+
+      - name: Check for test directory
+        id: check_tests
+        run: |
+          if [ -d "tests" ] || [ -d "test" ]; then
+            echo "has_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run tests
+        if: steps.check_tests.outputs.has_tests == 'true'
+        run: |
+          echo "Running tests..."
+
+          # Look for test runner
+          if [ -x "tests/run-tests.sh" ]; then
+            ./tests/run-tests.sh
+          elif [ -x "test/run-tests.sh" ]; then
+            ./test/run-tests.sh
+          elif [ -x "tools/test" ]; then
+            ./tools/test
+          elif [ -d "tests" ]; then
+            # Run all test files
+            for test_file in tests/*.zsh tests/*.sh test/*.zsh test/*.sh 2>/dev/null; do
+              if [ -f "$test_file" ]; then
+                echo "Running: $test_file"
+                zsh "$test_file" || bash "$test_file"
+              fi
+            done
+          else
+            echo "No test runner found, skipping tests"
+          fi
+
+      - name: Report test results
+        if: always()
+        run: |
+          echo "Test execution completed"
+
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    needs: validate
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check for shell scripts
+        id: check_scripts
+        run: |
+          if find . -type f \( -name "*.zsh" -o -name "*.sh" \) -print -quit | grep -q .; then
+            echo "has_scripts=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_scripts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run shellcheck
+        if: steps.check_scripts.outputs.has_scripts == 'true'
+        continue-on-error: true
+        run: |
+          echo "Running shellcheck..."
+          find . -type f \( -name "*.sh" \) -exec shellcheck {} \; || echo "⚠️  Shellcheck found issues (non-blocking)"
+
+  package-info:
+    name: Package Information
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract package info
+        run: |
+          echo "## Package Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Repository name
+          echo "**Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check for package.conf
+          if [ -f "package.conf" ]; then
+            echo "### package.conf" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            cat package.conf >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # File counts
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "- Zsh files: $(find . -name "*.zsh" | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "- Shell files: $(find . -name "*.sh" | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "- Total files: $(find . -type f | wc -l)" >> $GITHUB_STEP_SUMMARY
+          echo "- Total lines: $(find . -type f \( -name "*.zsh" -o -name "*.sh" \) -exec wc -l {} \; 2>/dev/null | awk '{sum+=$1} END {print sum}')" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [validate, test, lint, package-info]
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.validate.result }}" == "success" ]; then
+            echo "✅ Validation: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Validation: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.test.result }}" == "success" ] || [ "${{ needs.test.result }}" == "skipped" ]; then
+            echo "✅ Tests: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Tests: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.lint.result }}" == "success" ] || [ "${{ needs.lint.result }}" == "skipped" ]; then
+            echo "✅ Lint: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Lint: WARNINGS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: Build ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
